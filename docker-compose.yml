@@ -1,0 +1,34 @@
+
+services:
+  redis:
+    image: redis:7.2-alpine
+    container_name: sti-redis
+    restart: unless-stopped
+
+    # Force 100% volatile RAM mode — zero persistence sweeps
+    # --appendonly no  → disables AOF (Append-Only File) journaling
+    # --save ""        → disables RDB snapshot dumps entirely
+    # Result: Redis holds all data purely in RAM. On container stop, all data is gone.
+    # This is intentional — STI game state must never survive a server restart.
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+
+    ports:
+      # Exposes Redis on localhost:6379 for NestJS (ioredis) to connect
+      - "6379:6379"
+
+    # Cap memory to 256MB — protects the M4 host mac "pinocchio" from runaway stroke data
+    # allkeys-lru: if RAM cap is hit, Redis evicts the least-recently-used keys automatically
+    # This is a safety net — CleanupService should always purge before this triggers
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    volumes: []
+    # Explicitly NO volume mounts — reinforces zero-disk footprint contract
