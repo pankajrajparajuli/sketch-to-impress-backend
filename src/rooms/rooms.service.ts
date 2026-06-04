@@ -36,7 +36,7 @@ export class RoomsService {
 
     const metaKey = REDIS_KEYS.ROOM_META(roomCode);
     const stateKey = REDIS_KEYS.ROOM_STATE(roomCode);
-    const playersKey = REDIS_KEYS.ROOM_PLAYERS(roomCode);
+    const reservationKey = REDIS_KEYS.RESERVATION(roomCode, hostId);
 
     const pipeline = this.redis.getClient().pipeline();
 
@@ -54,20 +54,19 @@ export class RoomsService {
       theme: 'Cartoon',
     });
 
-    pipeline.hset(
-      playersKey,
-      hostId,
+    // ✅ FIXED: Using pipeline.setex() to safely avoid argument limits or type mismatch variations
+    pipeline.setex(
+      reservationKey,
+      RESERVATION_TTL_SECONDS,
       JSON.stringify({
         playerId: hostId,
         username: 'Host',
-        isHost: true,
-        connected: true,
+        reservedAt: Date.now(),
       }),
     );
 
     pipeline.expire(metaKey, ROOM_TTL_SECONDS);
     pipeline.expire(stateKey, ROOM_TTL_SECONDS);
-    pipeline.expire(playersKey, ROOM_TTL_SECONDS);
 
     await pipeline.exec();
 
@@ -102,10 +101,8 @@ export class RoomsService {
     }
 
     // ── 3. Count active roster + pending reservations ────────────────────────
-    // Total occupancy = confirmed players + temporary reservation slots
-    // This prevents over-allocation in high-concurrency join scenarios
     const playersKey = REDIS_KEYS.ROOM_PLAYERS(roomCode);
-    const activeCount = await this.redis.getClient().hlen(playersKey);
+    const activeCount = await this.redis.getClient().scard(playersKey);
 
     // Count pending reservations via key scan pattern
     const reservationPattern = `sti:v1:room:${roomCode}:reservation:*`;
@@ -131,14 +128,16 @@ export class RoomsService {
     });
 
     // ── 5. Write 10-second reservation slot (atomic slot lock) ───────────────
-    // Holds the player's seat while the client transitions from HTTP → WebSocket
-    // The WebSocket gateway clears this and writes the permanent player entry
     const reservationKey = REDIS_KEYS.RESERVATION(roomCode, playerId);
-    await this.redis.set(
-      reservationKey,
-      JSON.stringify({ playerId, username, reservedAt: Date.now() }),
-      RESERVATION_TTL_SECONDS,
-    );
+
+    // ✅ FIXED: Switched directly to setex for structural consistency
+    await this.redis
+      .getClient()
+      .setex(
+        reservationKey,
+        RESERVATION_TTL_SECONDS,
+        JSON.stringify({ playerId, username, reservedAt: Date.now() }),
+      );
 
     // ── 6. Refresh room TTL to keep session alive ────────────────────────────
     const currentRound = parseInt(

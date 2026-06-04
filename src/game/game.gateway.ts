@@ -11,9 +11,9 @@ import * as jwt from 'jsonwebtoken';
 import { RedisService } from '../redis/redis.service';
 import { REDIS_KEYS } from '../redis/redis.keys';
 import { RoomStatus } from '../rooms/enums/room-status.enum';
+import { GameService } from './game.service';
 import {
   V1ReconnectState,
-  RosterPlayer,
   LeaderboardEntry,
 } from './interfaces/v1-reconnect-state.interface';
 
@@ -32,7 +32,6 @@ interface CustomSocketData {
   isHost: boolean;
 }
 
-// Explicit type for our application sockets
 type AppSocket = Socket<any, any, any, CustomSocketData>;
 
 @WebSocketGateway({
@@ -54,7 +53,10 @@ export class GameGateway
 
   private readonly logger = new Logger(GameGateway.name);
 
-  constructor(private readonly redis: RedisService) {}
+  constructor(
+    private readonly redis: RedisService,
+    private readonly gameService: GameService,
+  ) {}
 
   afterInit(): void {
     this.logger.log(
@@ -70,7 +72,6 @@ export class GameGateway
 
   async handleConnection(client: AppSocket): Promise<void> {
     try {
-      // Safely extract from handshake structures typed as 'any'
       const auth = client.handshake.auth as Record<string, unknown> | undefined;
       const headers = client.handshake.headers as
         | Record<string, string | undefined>
@@ -79,7 +80,7 @@ export class GameGateway
       const token =
         (auth?.token as string | undefined) ??
         headers?.authorization?.replace('Bearer ', '') ??
-        (client.handshake.query?.token as string | undefined); // Added query fallback for Postman testing
+        (client.handshake.query?.token as string | undefined);
 
       if (!token) {
         this.rejectClient(
@@ -126,16 +127,16 @@ export class GameGateway
       const phase = (roomState.status as RoomStatus) ?? RoomStatus.LOBBY;
       const currentRound = parseInt(roomState.currentRound ?? '1', 10);
 
-      // ── Check if this is a reconnection (player already in roster) ─────────
-      const playersKey = REDIS_KEYS.ROOM_PLAYERS(roomCode);
-      const existingPlayerRaw = await this.redis.hget(playersKey, playerId);
-      const isReconnecting = existingPlayerRaw !== null;
+      // ── Check if this is a reconnection using the Player's individual Hash ──
+      const playerHashKey = REDIS_KEYS.PLAYER_HASH(playerId);
+      const existingPlayerRaw = await this.redis.hgetall(playerHashKey);
+      const isReconnecting =
+        existingPlayerRaw && Object.keys(existingPlayerRaw).length > 0;
 
       // ── Fetch username ─────────────────────────────────────────────────────
       let username = 'Unknown';
-      if (isReconnecting && existingPlayerRaw) {
-        const existing = JSON.parse(existingPlayerRaw) as RosterPlayer;
-        username = existing.username;
+      if (isReconnecting && existingPlayerRaw.username) {
+        username = existingPlayerRaw.username;
       } else {
         const reservationKey = REDIS_KEYS.RESERVATION(roomCode, playerId);
         const reservationRaw = await this.redis.get(reservationKey);
@@ -148,35 +149,22 @@ export class GameGateway
         }
       }
 
-      // ── Bind verified identity onto socket.data ────────────────────────────
+      // ── Bind identity onto socket context ──────────────────────────────────
       client.data.playerId = playerId;
       client.data.roomCode = roomCode;
       client.data.username = username;
       client.data.isHost = isHost;
 
-      // ── Join the Socket.io room channel ────────────────────────────────────
-      await client.join(roomCode);
-
-      // ── Update player presence in Redis ───────────────────────────────────
-      await this.redis.savePlayerPresence(roomCode, {
-        playerId,
-        username,
-        isHost,
-        connected: true,
-      });
-
-      // Legacy fallback storage to retain dynamic roster updates until completely migrated
-      await this.redis.hset(
-        playersKey,
-        playerId,
-        JSON.stringify({
-          playerId,
-          username,
-          isHost,
-          connected: true,
-        }),
+      // ── Save/Update Roster state cleanly via GameService ───────────────────
+      await this.gameService.addPlayerToRoster(
+        client.data.roomCode,
+        client.data.playerId,
+        client.data.username,
+        client.data.isHost,
       );
 
+      // ── Join Socket Channel ────────────────────────────────────────────────
+      await client.join(client.data.roomCode);
       await this.redis.touchRoom(roomCode, currentRound);
 
       this.logger.log(
@@ -200,10 +188,14 @@ export class GameGateway
         );
         client.emit('v1:player:reconnected', snapshot);
       } else {
-        const roster = await this.getRoster(roomCode);
-        this.server
-          .to(roomCode)
-          .emit('v1:room:roster_updated', { players: roster });
+        const roster = await this.gameService.getRoomRoster(
+          client.data.roomCode,
+        );
+
+        this.server.to(client.data.roomCode).emit('v1:room:player_joined', {
+          roomCode: client.data.roomCode,
+          players: roster,
+        });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Connection error.';
@@ -219,17 +211,12 @@ export class GameGateway
     if (!playerId || !roomCode) return;
 
     try {
-      const playersKey = REDIS_KEYS.ROOM_PLAYERS(roomCode);
-      const playerRaw = await this.redis.hget(playersKey, playerId);
+      // Safely flip the 'connected' field inside the player's specific Hash map
+      const playerHashKey = REDIS_KEYS.PLAYER_HASH(playerId);
+      const playerExists = await this.redis.exists(playerHashKey);
 
-      if (playerRaw) {
-        const player = JSON.parse(playerRaw) as RosterPlayer;
-
-        await this.redis.hset(
-          playersKey,
-          playerId,
-          JSON.stringify({ ...player, connected: false }),
-        );
+      if (playerExists) {
+        await this.redis.hset(playerHashKey, 'connected', 'false');
       }
 
       this.logger.log(
@@ -241,7 +228,8 @@ export class GameGateway
         }),
       );
 
-      const roster = await this.getRoster(roomCode);
+      // ✅ FIXED: Replaced legacy getRoster with clean gameService Set query
+      const roster = await this.gameService.getRoomRoster(roomCode);
       this.server
         .to(roomCode)
         .emit('v1:room:roster_updated', { players: roster });
@@ -273,12 +261,6 @@ export class GameGateway
     client.disconnect(true);
   }
 
-  async getRoster(roomCode: string): Promise<RosterPlayer[]> {
-    const playersKey = REDIS_KEYS.ROOM_PLAYERS(roomCode);
-    const all = await this.redis.hgetall(playersKey);
-    return Object.values(all).map((raw) => JSON.parse(raw) as RosterPlayer);
-  }
-
   private async buildReconnectSnapshot(
     client: AppSocket,
     roomCode: string,
@@ -290,7 +272,8 @@ export class GameGateway
     const leaderboardKey = REDIS_KEYS.LEADERBOARD(roomCode);
     const leaderboardRaw = await this.redis.hgetall(leaderboardKey);
 
-    const roster = await this.getRoster(roomCode);
+    // ✅ FIXED: Replaced legacy getRoster with clean gameService Set query
+    const roster = await this.gameService.getRoomRoster(roomCode);
 
     const leaderboard: LeaderboardEntry[] = roster.map((p) => ({
       playerId: p.playerId,
