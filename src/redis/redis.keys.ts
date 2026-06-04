@@ -5,10 +5,18 @@
 // ──────────────────────────────────────────────────────────────────────────────
 
 export const REDIS_KEYS = {
+  // ── Infrastructure Keys ──────────────────────────────────────────────────────
+
+  /** Throttler & rate-limiting tracking key */
+  THROTTLE: (throttlerName: string, key: string): string =>
+    `sti:v1:throttle:${throttlerName}:${key}`,
+
   // ── Room-Level Keys ──────────────────────────────────────────────────────────
 
   /** Core room metadata hash: status, timerDuration, totalRounds, theme, hostId */
   ROOM_META: (roomCode: string): string => `sti:v1:room:${roomCode}:meta`,
+
+  PLAYER_HASH: (playerId: string): string => `sti:v1:player:${playerId}`,
 
   /** Active player roster set — stores serialized player JSON blobs */
   ROOM_PLAYERS: (roomCode: string): string => `sti:v1:room:${roomCode}:players`,

@@ -1,0 +1,7 @@
+export enum RoomStatus {
+  LOBBY = 'LOBBY',
+  DRAWING = 'DRAWING',
+  GALLERY = 'GALLERY',
+  ROUND_RESULTS = 'ROUND_RESULTS',
+  FINAL_RESULTS = 'FINAL_RESULTS',
+}

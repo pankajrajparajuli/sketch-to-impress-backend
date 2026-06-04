@@ -34,6 +34,43 @@ export class RedisService implements OnModuleDestroy {
     return this.client;
   }
 
+  // ── Game Roster Operations ──────────────────────────────────────────────────
+
+  /**
+   * Saves player presence details atomically to their hash and adds them to the room roster map.
+   */
+  async savePlayerPresence(
+    roomCode: string,
+    player: {
+      playerId: string;
+      username: string;
+      isHost: boolean;
+      connected: boolean;
+    },
+  ): Promise<void> {
+    const playerData = {
+      playerId: player.playerId,
+      username: player.username,
+      isHost: String(player.isHost),
+      connected: String(player.connected),
+    };
+
+    await this.client
+      .multi()
+      .hset(REDIS_KEYS.PLAYER_HASH(player.playerId), playerData)
+      .hset(
+        REDIS_KEYS.ROOM_PLAYERS(roomCode),
+        player.playerId,
+        JSON.stringify({
+          playerId: player.playerId,
+          username: player.username,
+          isHost: player.isHost,
+          connected: player.connected,
+        }),
+      )
+      .exec();
+  }
+
   // ── TTL Refresh ────────────────────────────────────────────────────────────
 
   /**
