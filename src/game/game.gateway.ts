@@ -1,3 +1,14 @@
+import { UseGuards, ValidationPipe, UsePipes } from '@nestjs/common';
+
+import {
+  SubscribeMessage,
+  MessageBody,
+  ConnectedSocket,
+} from '@nestjs/websockets';
+
+import { GatewayGuard } from '../common/guards/gateway.guard';
+import { UpdateSettingsDto } from './dto/update-settings.dto';
+
 import {
   WebSocketGateway,
   WebSocketServer,
@@ -66,6 +77,35 @@ export class GameGateway
         namespace: '/game',
       }),
     );
+  }
+
+  // ── WebSocket Ingestion Pipeline Event Listeners ─────────────────────────────
+
+  /**
+   * Intercepts host parameter modifications, persists changes to the volatile Redis cache layer,
+   * and broadcasts the fresh configuration matrices to all active session participants.
+   */
+  @UsePipes(new ValidationPipe())
+  @UseGuards(GatewayGuard)
+  @SubscribeMessage('v1:host:update_settings')
+  async updateSettings(
+    @ConnectedSocket() client: AppSocket,
+    @MessageBody(
+      new ValidationPipe({
+        whitelist: true,
+        transform: true,
+      }),
+    )
+    dto: UpdateSettingsDto,
+  ): Promise<void> {
+    const { roomCode } = client.data;
+
+    // 1. Commit changes to Redis via the central game engine service layer
+    await this.gameService.updateRoomSettings(roomCode, dto);
+
+    // 2. Broadcast structural state sync event to all clients in the channel room
+    this.server.to(roomCode).emit('v1:room:settings_changed', dto);
+    this.server.to(roomCode).emit('v1:room:settings_updated', dto);
   }
 
   // ── Client Connection ─────────────────────────────────────────────────────────
@@ -228,11 +268,37 @@ export class GameGateway
         }),
       );
 
-      // ✅ FIXED: Replaced legacy getRoster with clean gameService Set query
       const roster = await this.gameService.getRoomRoster(roomCode);
-      this.server
-        .to(roomCode)
-        .emit('v1:room:roster_updated', { players: roster });
+      const anyConnected = roster.some((p) => p.connected);
+
+      if (!anyConnected && roster.length > 0) {
+        this.logger.log(
+          JSON.stringify({
+            event: 'room_evicted',
+            roomCode,
+            message:
+              'All players disconnected. Evicting room and flushing keys.',
+          }),
+        );
+
+        const keysToDelete = [
+          REDIS_KEYS.ROOM_META(roomCode),
+          REDIS_KEYS.ROOM_PLAYERS(roomCode),
+          REDIS_KEYS.ROOM_STATE(roomCode),
+          REDIS_KEYS.LEADERBOARD(roomCode),
+          REDIS_KEYS.USED_PROMPTS(roomCode),
+        ];
+
+        roster.forEach((p) => {
+          keysToDelete.push(REDIS_KEYS.PLAYER_HASH(p.playerId));
+        });
+
+        await this.redis.del(...keysToDelete);
+      } else {
+        this.server
+          .to(roomCode)
+          .emit('v1:room:roster_updated', { players: roster });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Disconnect error.';
       this.logger.error(
@@ -272,7 +338,6 @@ export class GameGateway
     const leaderboardKey = REDIS_KEYS.LEADERBOARD(roomCode);
     const leaderboardRaw = await this.redis.hgetall(leaderboardKey);
 
-    // ✅ FIXED: Replaced legacy getRoster with clean gameService Set query
     const roster = await this.gameService.getRoomRoster(roomCode);
 
     const leaderboard: LeaderboardEntry[] = roster.map((p) => ({

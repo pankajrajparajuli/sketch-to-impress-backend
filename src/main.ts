@@ -4,7 +4,11 @@ import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { WsExceptionFilter } from './common/filters/ws-exception.filter';
 
-async function bootstrap(): Promise<void> {
+export async function bootstrap(): Promise<void> {
+  if (process.env.NODE_ENV === 'test') {
+    return;
+  }
+
   const app = await NestFactory.create(AppModule);
 
   // ── Global DTO validation ────────────────────────────────────────────────
@@ -24,4 +28,6 @@ async function bootstrap(): Promise<void> {
   console.log(`[Bootstrap] sketch-to-impress-backend running on port 3000`);
 }
 
-bootstrap();
+if (process.env.NODE_ENV !== 'test') {
+  bootstrap();
+}

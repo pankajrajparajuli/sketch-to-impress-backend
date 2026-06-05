@@ -7,6 +7,29 @@ import { RoomPlayer } from './interfaces/v1-room-player.interface';
 export class GameService {
   constructor(private readonly redisService: RedisService) {}
 
+  /**
+   * Updates dynamic match constraints and parameters inside the volatile Redis room meta hash.
+   */
+  async updateRoomSettings(
+    roomCode: string,
+    settings: {
+      timerDuration: number;
+      totalRounds: number;
+      theme: string;
+    },
+  ): Promise<void> {
+    const redis = this.redisService.getClient();
+
+    await redis.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
+      timerDuration: String(settings.timerDuration),
+      totalRounds: String(settings.totalRounds),
+      theme: settings.theme,
+    });
+  }
+
+  /**
+   * Adds a user to the real-time room set registry and initializes their configuration hash map.
+   */
   async addPlayerToRoster(
     roomCode: string,
     playerId: string,
@@ -28,6 +51,9 @@ export class GameService {
     await pipeline.exec();
   }
 
+  /**
+   * Retrieves structural entity details for all tracked players within an active room roster via parallel pipelines.
+   */
   async getRoomRoster(roomCode: string): Promise<RoomPlayer[]> {
     const redis = this.redisService.getClient();
 
