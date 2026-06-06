@@ -152,6 +152,65 @@ export class GameService {
   }
 
   /**
+   * Filters the retrieved room roster to return only actively connected session participants.
+   */
+  async getConnectedPlayers(roomCode: string): Promise<RoomPlayer[]> {
+    const roster = await this.getRoomRoster(roomCode);
+    return roster.filter((player) => player.connected);
+  }
+
+  /**
+   * Scans for all keys matching the system wildcard namespace assigned to a unique room session
+   * and purges them completely from memory storage.
+   */
+  async cleanupRoom(roomCode: string): Promise<void> {
+    const redis = this.redisService.getClient();
+
+    const keys = await redis.keys(`sti:v1:room:${roomCode}:*`);
+
+    if (keys.length === 0) {
+      return;
+    }
+
+    await redis.del(...keys);
+  }
+
+  /**
+   * Automatically promotes the next available connected player to room host when the current host leaves.
+   * If no connected players are found, executes an full workspace cluster cleanup.
+   */
+  async migrateHost(roomCode: string): Promise<RoomPlayer | null> {
+    const redis = this.redisService.getClient();
+    const activePlayers = await this.getConnectedPlayers(roomCode);
+
+    const newHost = activePlayers[0];
+
+    // Explicitly check for both empty array and undefined element values to satisfy strict compilation
+    if (!newHost) {
+      await this.cleanupRoom(roomCode);
+      return null;
+    }
+
+    await redis.hset(REDIS_KEYS.PLAYER_HASH(newHost.playerId), {
+      isHost: 'true',
+    });
+
+    return newHost;
+  }
+
+  /**
+   * Audits active socket connection count within a targeted room code, initiating complete engine wipeouts
+   * if the cluster registry evaluates down to zero remaining connections.
+   */
+  async checkRoomOccupancy(roomCode: string): Promise<void> {
+    const connectedPlayers = await this.getConnectedPlayers(roomCode);
+
+    if (connectedPlayers.length === 0) {
+      await this.cleanupRoom(roomCode);
+    }
+  }
+
+  /**
    * Constructs a contextual structural matrix state mapping snapshot for a reconnecting player node.
    */
   async buildReconnectSnapshot(

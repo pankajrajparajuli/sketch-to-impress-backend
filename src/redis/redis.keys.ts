@@ -22,6 +22,10 @@ export const REDIS_KEYS = {
   /** Room phase state hash: currentRound, phase, roundStartTimestamp, roundEndTimestamp */
   ROOM_STATE: (roomCode: string): string => `sti:v1:room:${roomCode}:state`,
 
+  /** Countdown tracking key for managing headless windows during host migrations */
+  HOST_MIGRATION_TIMER: (roomCode: string): string =>
+    `sti:v1:room:${roomCode}:host-migration`,
+
   /** SETNX game-start lock — prevents duplicate match initializations */
   GAME_START_LOCK: (roomCode: string): string =>
     `sti:v1:room:${roomCode}:game-start-lock`,

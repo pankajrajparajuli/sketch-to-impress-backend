@@ -238,7 +238,7 @@ export class GameGateway
   // ── Client Disconnect ─────────────────────────────────────────────────────────
 
   async handleDisconnect(client: AppSocket): Promise<void> {
-    const { playerId, roomCode } = client.data;
+    const { playerId, roomCode, isHost } = client.data;
 
     if (!playerId || !roomCode) return;
 
@@ -253,37 +253,64 @@ export class GameGateway
           playerId,
           roomCode,
           socketId: client.id,
+          isHost,
         }),
       );
 
+      // 2. Asynchronous Host Migration Orchestration Execution Path
+      if (isHost) {
+        // Corrected signature signature to pass a standard synchronous callback to setTimeout
+        setTimeout(() => {
+          // Wrap async business operational paths cleanly inside a standalone block
+          const runMigration = async (): Promise<void> => {
+            const stillDisconnected =
+              !(await this.gameService.canReconnect(playerId));
+
+            if (stillDisconnected) {
+              this.logger.log(
+                JSON.stringify({
+                  event: 'host_migration_triggered',
+                  roomCode,
+                  message:
+                    'Host failed to reconnect within grace window. Executing migration.',
+                }),
+              );
+
+              const newHost = await this.gameService.migrateHost(roomCode);
+
+              if (newHost) {
+                this.server.to(roomCode).emit('v1:room:host_changed', {
+                  roomCode,
+                  hostId: newHost.playerId,
+                  username: newHost.username,
+                });
+              }
+            }
+          };
+
+          // Execute async logic chain and securely trap untracked exceptions
+          runMigration().catch((err) => {
+            const message =
+              err instanceof Error
+                ? err.message
+                : 'Migration process exception.';
+            this.logger.error(
+              JSON.stringify({
+                event: 'host_migration_error',
+                roomCode,
+                message,
+              }),
+            );
+          });
+        }, 30000); // 30 seconds reconnect grace window matching your system cache defaults
+      }
+
+      // 3. Centralized validation guard checks for completely empty rooms
+      await this.gameService.checkRoomOccupancy(roomCode);
+
+      // 4. Update remaining clients if the room was not dropped entirely
       const roster = await this.gameService.getRoomRoster(roomCode);
-      const anyConnected = roster.some((p) => p.connected);
-
-      // 2. If absolutely zero connected human sockets remain, teardown/evict the workspace cluster
-      if (!anyConnected && roster.length > 0) {
-        this.logger.log(
-          JSON.stringify({
-            event: 'room_evicted',
-            roomCode,
-            message:
-              'All players disconnected. Evicting room and flushing keys.',
-          }),
-        );
-
-        const keysToDelete = [
-          REDIS_KEYS.ROOM_META(roomCode),
-          REDIS_KEYS.ROOM_PLAYERS(roomCode),
-          REDIS_KEYS.ROOM_STATE(roomCode),
-          REDIS_KEYS.LEADERBOARD(roomCode),
-          REDIS_KEYS.USED_PROMPTS(roomCode),
-        ];
-
-        roster.forEach((p) => {
-          keysToDelete.push(REDIS_KEYS.PLAYER_HASH(p.playerId));
-        });
-
-        await this.redis.del(...keysToDelete);
-      } else {
+      if (roster.length > 0) {
         this.server
           .to(roomCode)
           .emit('v1:room:roster_updated', { players: roster });
