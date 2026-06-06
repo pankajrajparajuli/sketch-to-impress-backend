@@ -1,32 +1,23 @@
-import { UseGuards, ValidationPipe, UsePipes } from '@nestjs/common';
-
+import { Logger, UseGuards, UsePipes, ValidationPipe } from '@nestjs/common';
 import {
-  SubscribeMessage,
-  MessageBody,
   ConnectedSocket,
-} from '@nestjs/websockets';
-
-import { GatewayGuard } from '../common/guards/gateway.guard';
-import { UpdateSettingsDto } from './dto/update-settings.dto';
-
-import {
-  WebSocketGateway,
-  WebSocketServer,
+  MessageBody,
   OnGatewayConnection,
   OnGatewayDisconnect,
   OnGatewayInit,
+  SubscribeMessage,
+  WebSocketGateway,
+  WebSocketServer,
 } from '@nestjs/websockets';
-import { Logger } from '@nestjs/common';
-import { Server, Socket } from 'socket.io';
 import * as jwt from 'jsonwebtoken';
+import { Server, Socket } from 'socket.io';
+
+import { GatewayGuard } from '../common/guards/gateway.guard';
 import { RedisService } from '../redis/redis.service';
 import { REDIS_KEYS } from '../redis/redis.keys';
 import { RoomStatus } from '../rooms/enums/room-status.enum';
 import { GameService } from './game.service';
-import {
-  V1ReconnectState,
-  LeaderboardEntry,
-} from './interfaces/v1-reconnect-state.interface';
+import { UpdateSettingsDto } from './dto/update-settings.dto';
 
 // ─── Decoded JWT shape ─────────────────────────────────────────────────────────
 interface JwtPayload {
@@ -48,7 +39,10 @@ type AppSocket = Socket<any, any, any, CustomSocketData>;
 @WebSocketGateway({
   namespace: '/game',
   cors: {
-    origin: '*',
+    // Splits multiple URLs if provided in .env, otherwise defaults to '*' for easy testing
+    origin: process.env.FRONTEND_URL
+      ? process.env.FRONTEND_URL.split(',')
+      : '*',
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -85,18 +79,12 @@ export class GameGateway
    * Intercepts host parameter modifications, persists changes to the volatile Redis cache layer,
    * and broadcasts the fresh configuration matrices to all active session participants.
    */
-  @UsePipes(new ValidationPipe())
+  @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
   @UseGuards(GatewayGuard)
   @SubscribeMessage('v1:host:update_settings')
   async updateSettings(
     @ConnectedSocket() client: AppSocket,
-    @MessageBody(
-      new ValidationPipe({
-        whitelist: true,
-        transform: true,
-      }),
-    )
-    dto: UpdateSettingsDto,
+    @MessageBody() dto: UpdateSettingsDto,
   ): Promise<void> {
     const { roomCode } = client.data;
 
@@ -161,25 +149,46 @@ export class GameGateway
         return;
       }
 
-      // ── Fetch current room state ───────────────────────────────────────────
-      const stateKey = REDIS_KEYS.ROOM_STATE(roomCode);
-      const roomState = await this.redis.hgetall(stateKey);
-      const phase = (roomState.status as RoomStatus) ?? RoomStatus.LOBBY;
-      const currentRound = parseInt(roomState.currentRound ?? '1', 10);
+      // ── Bind tracking properties onto context data object layer ───────────
+      client.data.playerId = playerId;
+      client.data.roomCode = roomCode;
+      client.data.isHost = isHost;
 
-      // ── Check if this is a reconnection using the Player's individual Hash ──
-      const playerHashKey = REDIS_KEYS.PLAYER_HASH(playerId);
-      const existingPlayerRaw = await this.redis.hgetall(playerHashKey);
-      const isReconnecting =
-        existingPlayerRaw && Object.keys(existingPlayerRaw).length > 0;
+      // ── Active Reconnection Logic Implementation ──────────────────────────
+      const canReconnect = await this.gameService.canReconnect(playerId);
 
-      // ── Fetch username ─────────────────────────────────────────────────────
-      let username = 'Unknown';
-      if (isReconnecting && existingPlayerRaw.username) {
-        username = existingPlayerRaw.username;
+      if (canReconnect) {
+        // 1. Recover standard data fields directly from the primary player state block
+        const playerHashKey = REDIS_KEYS.PLAYER_HASH(playerId);
+        const existingPlayerRaw = await this.redis.hgetall(playerHashKey);
+        client.data.username = existingPlayerRaw.username ?? 'Unknown';
+
+        // 2. Re-establish server memory mappings and sync pipeline states
+        await this.gameService.markPlayerConnected(playerId);
+        await client.join(roomCode);
+
+        // 3. Compile context matrices and deliver back down to client interface
+        const snapshot = await this.gameService.buildReconnectSnapshot(
+          roomCode,
+          playerId,
+        );
+        client.emit('v1:player:reconnected', snapshot);
+
+        this.logger.log(
+          JSON.stringify({
+            event: 'player_reconnected',
+            playerId,
+            roomCode,
+            socketId: client.id,
+            phase: snapshot.phase,
+          }),
+        );
       } else {
+        // ── Fresh Connection Flow Process ───────────────────────────────────
         const reservationKey = REDIS_KEYS.RESERVATION(roomCode, playerId);
         const reservationRaw = await this.redis.get(reservationKey);
+        let username = 'Unknown';
+
         if (reservationRaw) {
           const reservation = JSON.parse(reservationRaw) as {
             username: string;
@@ -187,55 +196,38 @@ export class GameGateway
           username = reservation.username;
           await this.redis.del(reservationKey);
         }
-      }
 
-      // ── Bind identity onto socket context ──────────────────────────────────
-      client.data.playerId = playerId;
-      client.data.roomCode = roomCode;
-      client.data.username = username;
-      client.data.isHost = isHost;
+        client.data.username = username;
 
-      // ── Save/Update Roster state cleanly via GameService ───────────────────
-      await this.gameService.addPlayerToRoster(
-        client.data.roomCode,
-        client.data.playerId,
-        client.data.username,
-        client.data.isHost,
-      );
-
-      // ── Join Socket Channel ────────────────────────────────────────────────
-      await client.join(client.data.roomCode);
-      await this.redis.touchRoom(roomCode, currentRound);
-
-      this.logger.log(
-        JSON.stringify({
-          event: isReconnecting ? 'player_reconnected' : 'player_connected',
-          playerId,
-          roomCode,
-          socketId: client.id,
-          phase,
-        }),
-      );
-
-      if (isReconnecting) {
-        const snapshot = await this.buildReconnectSnapshot(
-          client,
+        // Save entry allocations to storage cache layers
+        await this.gameService.addPlayerToRoster(
           roomCode,
           playerId,
-          phase,
-          roomState,
-          currentRound,
+          username,
+          isHost,
         );
-        client.emit('v1:player:reconnected', snapshot);
-      } else {
-        const roster = await this.gameService.getRoomRoster(
-          client.data.roomCode,
-        );
+        await client.join(roomCode);
 
-        this.server.to(client.data.roomCode).emit('v1:room:player_joined', {
-          roomCode: client.data.roomCode,
+        const stateKey = REDIS_KEYS.ROOM_STATE(roomCode);
+        const roomState = await this.redis.hgetall(stateKey);
+        const currentRound = parseInt(roomState.currentRound ?? '1', 10);
+        await this.redis.touchRoom(roomCode, currentRound);
+
+        const roster = await this.gameService.getRoomRoster(roomCode);
+        this.server.to(roomCode).emit('v1:room:player_joined', {
+          roomCode,
           players: roster,
         });
+
+        this.logger.log(
+          JSON.stringify({
+            event: 'player_connected',
+            playerId,
+            roomCode,
+            socketId: client.id,
+            phase: roomState.status ?? RoomStatus.LOBBY,
+          }),
+        );
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Connection error.';
@@ -251,13 +243,9 @@ export class GameGateway
     if (!playerId || !roomCode) return;
 
     try {
-      // Safely flip the 'connected' field inside the player's specific Hash map
-      const playerHashKey = REDIS_KEYS.PLAYER_HASH(playerId);
-      const playerExists = await this.redis.exists(playerHashKey);
-
-      if (playerExists) {
-        await this.redis.hset(playerHashKey, 'connected', 'false');
-      }
+      // 1. Mark player offline and establish the temporary grace window in Redis
+      await this.gameService.markPlayerDisconnected(playerId);
+      await this.gameService.createReconnectWindow(playerId);
 
       this.logger.log(
         JSON.stringify({
@@ -271,6 +259,7 @@ export class GameGateway
       const roster = await this.gameService.getRoomRoster(roomCode);
       const anyConnected = roster.some((p) => p.connected);
 
+      // 2. If absolutely zero connected human sockets remain, teardown/evict the workspace cluster
       if (!anyConnected && roster.length > 0) {
         this.logger.log(
           JSON.stringify({
@@ -325,45 +314,5 @@ export class GameGateway
     );
     client.emit('error:exception', { success: false, code, message });
     client.disconnect(true);
-  }
-
-  private async buildReconnectSnapshot(
-    client: AppSocket,
-    roomCode: string,
-    playerId: string,
-    phase: RoomStatus,
-    roomState: Record<string, string>,
-    currentRound: number,
-  ): Promise<V1ReconnectState> {
-    const leaderboardKey = REDIS_KEYS.LEADERBOARD(roomCode);
-    const leaderboardRaw = await this.redis.hgetall(leaderboardKey);
-
-    const roster = await this.gameService.getRoomRoster(roomCode);
-
-    const leaderboard: LeaderboardEntry[] = roster.map((p) => ({
-      playerId: p.playerId,
-      username: p.username,
-      stars: parseInt(leaderboardRaw[p.playerId] ?? '0', 10),
-    }));
-
-    const roundEndTimestamp = parseInt(roomState.roundEndTimestamp ?? '0', 10);
-    const remainingTime =
-      roundEndTimestamp > 0
-        ? Math.max(0, Math.ceil((roundEndTimestamp - Date.now()) / 1000))
-        : 0;
-
-    return {
-      roomCode,
-      playerId,
-      phase,
-      currentRound,
-      totalRounds: parseInt(roomState.totalRounds ?? '3', 10),
-      timerDuration: parseInt(roomState.timerDuration ?? '90', 10),
-      theme: roomState.theme ?? 'Cartoon',
-      remainingTime,
-      activePrompt: roomState.activePrompt ?? null,
-      leaderboard,
-      players: roster,
-    };
   }
 }

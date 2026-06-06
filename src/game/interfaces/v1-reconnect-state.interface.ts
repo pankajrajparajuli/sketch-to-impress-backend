@@ -13,8 +13,8 @@ export interface V1ReconnectState {
   totalRounds: number;
   timerDuration: number;
   theme: string;
-  remainingTime: number; // seconds remaining in current phase clock
-  activePrompt: string | null; // null if in LOBBY phase
+  remainingTime: number; // Seconds remaining in the current phase clock
+  activePrompt: string | null; // Null if in LOBBY phase
   leaderboard: LeaderboardEntry[];
   players: RosterPlayer[];
 }

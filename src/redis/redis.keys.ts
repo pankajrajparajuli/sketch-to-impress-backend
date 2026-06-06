@@ -16,8 +16,6 @@ export const REDIS_KEYS = {
   /** Core room metadata hash: status, timerDuration, totalRounds, theme, hostId */
   ROOM_META: (roomCode: string): string => `sti:v1:room:${roomCode}:meta`,
 
-  PLAYER_HASH: (playerId: string): string => `sti:v1:player:${playerId}`,
-
   /** Active player roster set — stores serialized player JSON blobs */
   ROOM_PLAYERS: (roomCode: string): string => `sti:v1:room:${roomCode}:players`,
 
@@ -47,6 +45,13 @@ export const REDIS_KEYS = {
     `sti:v1:room:${roomCode}:round:${roundNumber}:drawings`,
 
   // ── Player-Level Keys ────────────────────────────────────────────────────────
+
+  /** Player connection/state tracking hash */
+  PLAYER_HASH: (playerId: string): string => `sti:v1:player:${playerId}`,
+
+  /** Player reconnection state tracking key */
+  PLAYER_RECONNECT: (playerId: string): string =>
+    `sti:v1:player:${playerId}:reconnect`,
 
   /** Per-player submission lock — SETNX blocks double-submit within a round */
   PLAYER_SUBMISSION_LOCK: (playerId: string): string =>

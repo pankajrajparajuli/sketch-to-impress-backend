@@ -2,6 +2,14 @@ import { Injectable } from '@nestjs/common';
 import { RedisService } from '../redis/redis.service';
 import { REDIS_KEYS } from '../redis/redis.keys';
 import { RoomPlayer } from './interfaces/v1-room-player.interface';
+import {
+  V1ReconnectState,
+  LeaderboardEntry,
+} from './interfaces/v1-reconnect-state.interface';
+import { RoomStatus } from '../rooms/enums/room-status.enum';
+
+// Fallback constant configuration for the grace period windows
+const RECONNECT_GRACE_SECONDS = 30;
 
 @Injectable()
 export class GameService {
@@ -89,5 +97,100 @@ export class GameService {
           connected: player.connected === 'true',
         }))
     );
+  }
+
+  /**
+   * Flips a player's inner state hash reference status value to disconnected.
+   */
+  async markPlayerDisconnected(playerId: string): Promise<void> {
+    const redis = this.redisService.getClient();
+
+    await redis.hset(REDIS_KEYS.PLAYER_HASH(playerId), {
+      connected: 'false',
+    });
+  }
+
+  /**
+   * Spawns a temporary expiration string flag in Redis acting as a structural guard window.
+   */
+  async createReconnectWindow(playerId: string): Promise<void> {
+    const redis = this.redisService.getClient();
+
+    await redis.set(
+      REDIS_KEYS.PLAYER_RECONNECT(playerId),
+      'pending',
+      'EX',
+      RECONNECT_GRACE_SECONDS,
+    );
+  }
+
+  /**
+   * Confirms whether a reconnect grace period window has expired or remains active.
+   */
+  async canReconnect(playerId: string): Promise<boolean> {
+    const redis = this.redisService.getClient();
+
+    const exists = await redis.exists(REDIS_KEYS.PLAYER_RECONNECT(playerId));
+
+    return exists === 1;
+  }
+
+  /**
+   * Atomic transaction pipeline that reverts connected states and wipes out transient window tracking keys.
+   */
+  async markPlayerConnected(playerId: string): Promise<void> {
+    const redis = this.redisService.getClient();
+    const pipeline = redis.pipeline();
+
+    pipeline.hset(REDIS_KEYS.PLAYER_HASH(playerId), {
+      connected: 'true',
+    });
+
+    pipeline.del(REDIS_KEYS.PLAYER_RECONNECT(playerId));
+
+    await pipeline.exec();
+  }
+
+  /**
+   * Constructs a contextual structural matrix state mapping snapshot for a reconnecting player node.
+   */
+  async buildReconnectSnapshot(
+    roomCode: string,
+    playerId: string,
+  ): Promise<V1ReconnectState> {
+    const redis = this.redisService.getClient();
+
+    const state = await redis.hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
+    const roster = await this.getRoomRoster(roomCode);
+    const leaderboardRaw = await redis.hgetall(
+      REDIS_KEYS.LEADERBOARD(roomCode),
+    );
+
+    const endTimestamp = Number(state.roundEndTimestamp ?? 0);
+    const remainingTime =
+      endTimestamp > 0
+        ? Math.max(0, Math.ceil((endTimestamp - Date.now()) / 1000))
+        : 0;
+
+    // Build standard, typed LeaderboardEntry schema matches using player data from our roster
+    const leaderboard: LeaderboardEntry[] = roster.map((p) => ({
+      playerId: p.playerId,
+      username: p.username,
+      stars: parseInt(leaderboardRaw[p.playerId] ?? '0', 10),
+    }));
+
+    return {
+      roomCode,
+      playerId,
+      phase: (state.status as RoomStatus) ?? RoomStatus.LOBBY,
+      currentRound: Number(state.currentRound ?? 1),
+      totalRounds: Number(state.totalRounds ?? 3),
+      timerDuration: Number(state.timerDuration ?? 90),
+      theme: state.theme ?? 'Cartoon',
+      remainingTime,
+      activePrompt: state.activePrompt ?? null,
+      leaderboard,
+      players: roster,
+    };
   }
 }
