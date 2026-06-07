@@ -63,6 +63,14 @@ export class GameGateway
   ) {}
 
   afterInit(): void {
+    // Register the shared automated callback listener
+    this.gameService.registerPhaseChangeCallback((roomCode, status) => {
+      this.server.to(roomCode).emit('v1:game:phase_changed', {
+        roomCode,
+        status,
+      });
+    });
+
     this.logger.log(
       JSON.stringify({
         event: 'gateway_init',
@@ -140,32 +148,45 @@ export class GameGateway
     // 4. Fetch a unique random prompt based on the room's chosen theme
     const prompt = await this.gameService.getUniquePrompt(roomCode);
 
-    // 5. Broadcast phase transition and the initial round configuration
-    this.server.to(roomCode).emit('v1:game:phase_changed', {
-      roomCode,
-      status: RoomStatus.DRAWING,
-    });
-
+    // 5. Broadcast initial round configuration
+    // (Note: phase_changed broadcast handled by service callback injection points)
     this.server.to(roomCode).emit('v1:round:started', {
       roomCode,
       round: 1,
       prompt,
     });
+
+    // 6. Schedule downstream automated phase timeout tracking vectors
+    const roomState = await this.redis
+      .getClient()
+      .hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
+
+    const duration = Number(roomState.timerDuration ?? 90);
+
+    await this.gameService.schedulePhaseTransition(roomCode, duration);
   }
 
   /**
    * Evaluates chronological state flow indices, shifting game rooms cleanly into structural adjacent loops.
+   * Handles round iteration payload distributions cleanly if loops step back into DRAWING status configurations.
    */
   @SubscribeMessage('v1:debug:advance_phase')
   async advancePhase(@ConnectedSocket() client: AppSocket): Promise<void> {
     const { roomCode } = client.data;
 
-    const next = await this.gameService.advancePhase(roomCode);
+    // Destructure the returned configuration payload from the newly refactored service method
+    const { next, currentRound, prompt } =
+      await this.gameService.advancePhase(roomCode);
 
-    this.server.to(roomCode).emit('v1:game:phase_changed', {
-      roomCode,
-      status: next,
-    });
+    // If the room cycled back into a fresh DRAWING phase loop and carries valid configuration parameters, dispatch events
+    // (Note: phase_changed broadcast handled by service callback injection points)
+    if (next === RoomStatus.DRAWING && prompt) {
+      this.server.to(roomCode).emit('v1:round:started', {
+        roomCode,
+        round: currentRound,
+        prompt,
+      });
+    }
   }
 
   // ── Client Connection ─────────────────────────────────────────────────────────

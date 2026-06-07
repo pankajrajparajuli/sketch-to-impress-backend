@@ -8,29 +8,109 @@ import {
 } from './interfaces/v1-reconnect-state.interface';
 import { RoomStatus } from '../rooms/enums/room-status.enum';
 import { PROMPTS, PromptTheme } from './constants/prompts';
+import { GAME_TIMERS } from './constants/game-timers';
 
-// Fallback constant configuration for the grace period windows
 const RECONNECT_GRACE_SECONDS = 30;
 
 @Injectable()
 export class GameService {
+  private readonly phaseTimers = new Map<string, NodeJS.Timeout>();
+
+  // 1. Define the private callback property
+  private phaseChangeCallback?: (roomCode: string, status: RoomStatus) => void;
+
   constructor(private readonly redisService: RedisService) {}
 
-  /**
-   * Retrieves all prompt IDs or strings that have already been served to this room.
-   */
-  async getUsedPrompts(roomCode: string): Promise<string[]> {
+  // 2. Add the registration method
+  registerPhaseChangeCallback(
+    callback: (roomCode: string, status: RoomStatus) => void,
+  ): void {
+    this.phaseChangeCallback = callback;
+  }
+
+  private clearPhaseTimer(roomCode: string): void {
+    const timer = this.phaseTimers.get(roomCode);
+
+    if (!timer) {
+      return;
+    }
+
+    clearTimeout(timer);
+    this.phaseTimers.delete(roomCode);
+  }
+
+  async schedulePhaseTransition(
+    roomCode: string,
+    durationSeconds: number,
+  ): Promise<void> {
     const redis = this.redisService.getClient();
 
+    this.clearPhaseTimer(roomCode);
+
+    const roundEndTimestamp = Date.now() + durationSeconds * 1000;
+
+    await redis.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
+      roundEndTimestamp: String(roundEndTimestamp),
+    });
+
+    // Synchronous callback wrapping the async execution to satisfy ESLint constraints
+    const timer = setTimeout(() => {
+      this.handlePhaseTimeout(roomCode).catch((err) => {
+        // Safe logging fallback for background job failure
+        console.error(
+          `[GameService] Phase timeout failure for room ${roomCode}:`,
+          err,
+        );
+      });
+    }, durationSeconds * 1000);
+
+    this.phaseTimers.set(roomCode, timer);
+  }
+
+  async handlePhaseTimeout(roomCode: string): Promise<void> {
+    // Destructure 'next' from the object returned by advancePhase
+    const { next } = await this.advancePhase(roomCode);
+
+    switch (next) {
+      case RoomStatus.GALLERY:
+        await this.schedulePhaseTransition(
+          roomCode,
+          GAME_TIMERS.GALLERY_SECONDS,
+        );
+        break;
+
+      case RoomStatus.ROUND_RESULTS:
+        await this.schedulePhaseTransition(
+          roomCode,
+          GAME_TIMERS.ROUND_RESULTS_SECONDS,
+        );
+        break;
+
+      case RoomStatus.DRAWING: {
+        const state = await this.redisService
+          .getClient()
+          .hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
+
+        const drawingTime = Number(state.timerDuration ?? 90);
+
+        // Note: advancePhase already calls getUniquePrompt() right before transitioning to DRAWING.
+        await this.schedulePhaseTransition(roomCode, drawingTime);
+        break;
+      }
+
+      case RoomStatus.FINAL_RESULTS:
+        this.clearPhaseTimer(roomCode);
+        break;
+    }
+  }
+
+  async getUsedPrompts(roomCode: string): Promise<string[]> {
+    const redis = this.redisService.getClient();
     return redis.smembers(REDIS_KEYS.PROMPT_HISTORY(roomCode));
   }
 
-  /**
-   * Pulls the assigned room theme configuration from state, falling back to 'RANDOM'.
-   */
   async getRoomTheme(roomCode: string): Promise<PromptTheme> {
     const redis = this.redisService.getClient();
-
     const roomState = await redis.hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
     const theme = roomState.theme ?? 'RANDOM';
 
@@ -42,16 +122,11 @@ export class GameService {
     ) {
       return 'RANDOM';
     }
-
     return theme;
   }
 
-  /**
-   * Selects an unplayed prompt based on the room theme, tracks it in history, and flags it as active.
-   */
   async getUniquePrompt(roomCode: string): Promise<string> {
     const redis = this.redisService.getClient();
-
     const theme = await this.getRoomTheme(roomCode);
     const usedPrompts = await this.getUsedPrompts(roomCode);
 
@@ -66,51 +141,42 @@ export class GameService {
     const randomIndex = Math.floor(Math.random() * availablePrompts.length);
     const prompt = availablePrompts[randomIndex];
 
-    // Explicit validation step to reassure the TS compiler that 'prompt' is strictly a string
     if (!prompt) {
       throw new Error(`Failed to retrieve a valid prompt from the pool.`);
     }
 
     const pipeline = redis.pipeline();
-
     pipeline.sadd(REDIS_KEYS.PROMPT_HISTORY(roomCode), prompt);
-    pipeline.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
-      activePrompt: prompt,
-    });
-
+    pipeline.hset(REDIS_KEYS.ROOM_STATE(roomCode), { activePrompt: prompt });
     await pipeline.exec();
 
     return prompt;
   }
 
-  /**
-   * Directly mutates the room phase status property within the Redis room meta state hash.
-   */
   async updateRoomStatus(roomCode: string, status: RoomStatus): Promise<void> {
     const redis = this.redisService.getClient();
-
-    await redis.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
-      status,
-    });
+    await redis.hset(REDIS_KEYS.ROOM_STATE(roomCode), { status });
   }
 
-  /**
-   * Retrieves the current room status value string, defaulting back to LOBBY on non-existent properties.
-   */
   async getRoomStatus(roomCode: string): Promise<RoomStatus> {
     const redis = this.redisService.getClient();
-
     const status = await redis.hget(REDIS_KEYS.ROOM_STATE(roomCode), 'status');
-
     return (status as RoomStatus) ?? RoomStatus.LOBBY;
   }
 
   /**
-   * Cycles the target room status context forward to its chronologically adjacent game engine phase.
+   * Cycles the target room status context forward.
+   * Fetches a new prompt if loop-cycling back into a fresh round.
    */
-  async advancePhase(roomCode: string): Promise<RoomStatus> {
+  async advancePhase(roomCode: string): Promise<{
+    next: RoomStatus;
+    currentRound?: number;
+    prompt?: string;
+  }> {
     const current = await this.getRoomStatus(roomCode);
     let next: RoomStatus;
+    let currentRound: number | undefined;
+    let prompt: string | undefined;
 
     switch (current) {
       case RoomStatus.LOBBY:
@@ -125,31 +191,50 @@ export class GameService {
         next = RoomStatus.ROUND_RESULTS;
         break;
 
-      case RoomStatus.ROUND_RESULTS:
-        next = RoomStatus.FINAL_RESULTS;
+      case RoomStatus.ROUND_RESULTS: {
+        const redis = this.redisService.getClient();
+        const state = await redis.hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
+
+        const roundData = Number(state.currentRound ?? 1);
+        const totalRounds = Number(state.totalRounds ?? 3);
+
+        if (roundData < totalRounds) {
+          currentRound = roundData + 1;
+
+          await redis.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
+            currentRound: String(currentRound),
+          });
+
+          // Generate a brand new prompt before returning to DRAWING phase
+          prompt = await this.getUniquePrompt(roomCode);
+          next = RoomStatus.DRAWING;
+        } else {
+          next = RoomStatus.FINAL_RESULTS;
+        }
         break;
+      }
 
       default:
         next = RoomStatus.FINAL_RESULTS;
     }
 
     await this.updateRoomStatus(roomCode, next);
-    return next;
+
+    // 3. Fire callback safely after state update finishes execution
+    this.phaseChangeCallback?.(roomCode, next);
+
+    return {
+      next,
+      currentRound,
+      prompt,
+    };
   }
 
-  /**
-   * Updates dynamic match constraints and parameters inside the volatile Redis room meta hash.
-   */
   async updateRoomSettings(
     roomCode: string,
-    settings: {
-      timerDuration: number;
-      totalRounds: number;
-      theme: string;
-    },
+    settings: { timerDuration: number; totalRounds: number; theme: string },
   ): Promise<void> {
     const redis = this.redisService.getClient();
-
     await redis.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
       timerDuration: String(settings.timerDuration),
       totalRounds: String(settings.totalRounds),
@@ -157,9 +242,6 @@ export class GameService {
     });
   }
 
-  /**
-   * Adds a user to the real-time room set registry and initializes their configuration hash map.
-   */
   async addPlayerToRoster(
     roomCode: string,
     playerId: string,
@@ -170,7 +252,6 @@ export class GameService {
     const pipeline = redis.pipeline();
 
     pipeline.sadd(REDIS_KEYS.ROOM_PLAYERS(roomCode), playerId);
-
     pipeline.hset(REDIS_KEYS.PLAYER_HASH(playerId), {
       playerId,
       username,
@@ -181,63 +262,38 @@ export class GameService {
     await pipeline.exec();
   }
 
-  /**
-   * Retrieves structural entity details for all tracked players within an active room roster via parallel pipelines.
-   */
   async getRoomRoster(roomCode: string): Promise<RoomPlayer[]> {
     const redis = this.redisService.getClient();
-
     const playerIds = await redis.smembers(REDIS_KEYS.ROOM_PLAYERS(roomCode));
 
-    if (!playerIds || playerIds.length === 0) {
-      return [];
-    }
+    if (!playerIds || playerIds.length === 0) return [];
 
     const pipeline = redis.pipeline();
-
     playerIds.forEach((playerId) => {
       pipeline.hgetall(REDIS_KEYS.PLAYER_HASH(playerId));
     });
 
     const results = await pipeline.exec();
+    if (!results) return [];
 
-    if (!results) {
-      return [];
-    }
-
-    return (
-      results
-        // 1. Extract the raw object from the pipeline response tuple [error, result]
-        .map((result) => result[1] as Record<string, string> | null)
-        // 2. Filter out null or completely empty objects
-        .filter((player): player is Record<string, string> => !!player)
-        // 3. Map to RoomPlayer, using nullish coalescing to guarantee strict string types
-        .map((player) => ({
-          playerId: player.playerId ?? '',
-          username: player.username ?? '',
-          isHost: player.isHost === 'true',
-          connected: player.connected === 'true',
-        }))
-    );
+    return results
+      .map((result) => result[1] as Record<string, string> | null)
+      .filter((player): player is Record<string, string> => !!player)
+      .map((player) => ({
+        playerId: player.playerId ?? '',
+        username: player.username ?? '',
+        isHost: player.isHost === 'true',
+        connected: player.connected === 'true',
+      }));
   }
 
-  /**
-   * Flips a player's inner state hash reference status value to disconnected.
-   */
   async markPlayerDisconnected(playerId: string): Promise<void> {
     const redis = this.redisService.getClient();
-
-    await redis.hset(REDIS_KEYS.PLAYER_HASH(playerId), {
-      connected: 'false',
-    });
+    await redis.hset(REDIS_KEYS.PLAYER_HASH(playerId), { connected: 'false' });
   }
 
-  /**
-   * Spawns a temporary expiration string flag in Redis acting as a structural guard window.
-   */
   async createReconnectWindow(playerId: string): Promise<void> {
     const redis = this.redisService.getClient();
-
     await redis.set(
       REDIS_KEYS.PLAYER_RECONNECT(playerId),
       'pending',
@@ -246,65 +302,37 @@ export class GameService {
     );
   }
 
-  /**
-   * Confirms whether a reconnect grace period window has expired or remains active.
-   */
   async canReconnect(playerId: string): Promise<boolean> {
     const redis = this.redisService.getClient();
-
     const exists = await redis.exists(REDIS_KEYS.PLAYER_RECONNECT(playerId));
-
     return exists === 1;
   }
 
-  /**
-   * Atomic transaction pipeline that reverts connected states and wipes out transient window tracking keys.
-   */
   async markPlayerConnected(playerId: string): Promise<void> {
     const redis = this.redisService.getClient();
     const pipeline = redis.pipeline();
 
-    pipeline.hset(REDIS_KEYS.PLAYER_HASH(playerId), {
-      connected: 'true',
-    });
-
+    pipeline.hset(REDIS_KEYS.PLAYER_HASH(playerId), { connected: 'true' });
     pipeline.del(REDIS_KEYS.PLAYER_RECONNECT(playerId));
-
     await pipeline.exec();
   }
 
-  /**
-   * Filters the retrieved room roster to return only actively connected session participants.
-   */
   async getConnectedPlayers(roomCode: string): Promise<RoomPlayer[]> {
     const roster = await this.getRoomRoster(roomCode);
     return roster.filter((player) => player.connected);
   }
 
-  /**
-   * Scans for all keys matching the system wildcard namespace assigned to a unique room session
-   * and purges them completely from memory storage.
-   */
   async cleanupRoom(roomCode: string): Promise<void> {
     const redis = this.redisService.getClient();
-
     const keys = await redis.keys(`sti:v1:room:${roomCode}:*`);
 
-    if (keys.length === 0) {
-      return;
-    }
-
+    if (keys.length === 0) return;
     await redis.del(...keys);
   }
 
-  /**
-   * Automatically promotes the next available connected player to room host when the current host leaves.
-   * If no connected players are found, executes an full workspace cluster cleanup.
-   */
   async migrateHost(roomCode: string): Promise<RoomPlayer | null> {
     const redis = this.redisService.getClient();
     const activePlayers = await this.getConnectedPlayers(roomCode);
-
     const newHost = activePlayers[0];
 
     if (!newHost) {
@@ -315,42 +343,31 @@ export class GameService {
     await redis.hset(REDIS_KEYS.PLAYER_HASH(newHost.playerId), {
       isHost: 'true',
     });
-
     return newHost;
   }
 
-  /**
-   * Audits active socket connection count within a targeted room code, initiating complete engine wipeouts
-   * if the cluster registry evaluates down to zero remaining connections.
-   */
   async checkRoomOccupancy(roomCode: string): Promise<void> {
     const connectedPlayers = await this.getConnectedPlayers(roomCode);
-
     if (connectedPlayers.length === 0) {
       await this.cleanupRoom(roomCode);
     }
   }
 
-  /**
-   * Constructs a contextual structural matrix state mapping snapshot for a reconnecting player node.
-   */
   async buildReconnectSnapshot(
     roomCode: string,
     playerId: string,
   ): Promise<V1ReconnectState> {
     const redis = this.redisService.getClient();
-
     const state = await redis.hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
     const roster = await this.getRoomRoster(roomCode);
     const leaderboardRaw = await redis.hgetall(
       REDIS_KEYS.LEADERBOARD(roomCode),
     );
 
-    const endTimestamp = Number(state.roundEndTimestamp ?? 0);
-    const remainingTime =
-      endTimestamp > 0
-        ? Math.max(0, Math.ceil((endTimestamp - Date.now()) / 1000))
-        : 0;
+    const remainingTime = Math.max(
+      0,
+      Math.floor((Number(state.roundEndTimestamp ?? 0) - Date.now()) / 1000),
+    );
 
     const leaderboard: LeaderboardEntry[] = roster.map((p) => ({
       playerId: p.playerId,

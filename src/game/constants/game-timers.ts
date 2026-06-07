@@ -1,0 +1,4 @@
+export const GAME_TIMERS = {
+  GALLERY_SECONDS: 15,
+  ROUND_RESULTS_SECONDS: 10,
+} as const;
