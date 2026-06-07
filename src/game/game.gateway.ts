@@ -1,3 +1,6 @@
+import { SubmitDrawingDto } from './dto/submit-drawing.dto';
+import { validateDrawingPayloadSize } from './validators/drawing-payload.validator';
+import { validateVectorOnlyPayload } from './validators/drawing-content.validator';
 import { Logger, UseGuards, UsePipes, ValidationPipe } from '@nestjs/common';
 import {
   ConnectedSocket,
@@ -81,6 +84,64 @@ export class GameGateway
   }
 
   // ── WebSocket Ingestion Pipeline Event Listeners ─────────────────────────────
+
+  /**
+   * Temporary isolated debug signature handler to inspect inbound message integrity rules,
+   * isolating client serialization faults from structural payload pipeline blockers.
+   */
+  @UsePipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: true,
+    }),
+  )
+  @SubscribeMessage('v1:canvas:submit_drawing')
+  async handleSubmitDrawing(
+    @ConnectedSocket() client: AppSocket,
+    @MessageBody() dto: SubmitDrawingDto,
+  ): Promise<{
+    success: boolean;
+    playerId: string;
+    strokeCount: number;
+  }> {
+    const { playerId, roomCode } = client.data;
+
+    validateVectorOnlyPayload(dto);
+    validateDrawingPayloadSize(dto);
+
+    const roomState = await this.redis
+      .getClient()
+      .hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
+
+    if (roomState.status !== RoomStatus.DRAWING) {
+      throw new Error(
+        `Drawing submissions are only allowed during ${RoomStatus.DRAWING}`,
+      );
+    }
+
+    const currentRound = Number(roomState.currentRound ?? 1);
+
+    const drawingKey = `sti:v1:room:${roomCode}:round:${currentRound}:player:${playerId}`;
+
+    await this.redis.getClient().set(drawingKey, JSON.stringify(dto.strokes));
+
+    this.logger.log(
+      JSON.stringify({
+        event: 'drawing_stored',
+        roomCode,
+        currentRound,
+        playerId,
+        strokeCount: dto.strokes.length,
+      }),
+    );
+
+    return {
+      success: true,
+      playerId,
+      strokeCount: dto.strokes.length,
+    };
+  }
 
   /**
    * Intercepts host parameter modifications, persists changes to the volatile Redis cache layer,
