@@ -7,6 +7,7 @@ import {
   LeaderboardEntry,
 } from './interfaces/v1-reconnect-state.interface';
 import { RoomStatus } from '../rooms/enums/room-status.enum';
+import { PROMPTS, PromptTheme } from './constants/prompts';
 
 // Fallback constant configuration for the grace period windows
 const RECONNECT_GRACE_SECONDS = 30;
@@ -14,6 +15,127 @@ const RECONNECT_GRACE_SECONDS = 30;
 @Injectable()
 export class GameService {
   constructor(private readonly redisService: RedisService) {}
+
+  /**
+   * Retrieves all prompt IDs or strings that have already been served to this room.
+   */
+  async getUsedPrompts(roomCode: string): Promise<string[]> {
+    const redis = this.redisService.getClient();
+
+    return redis.smembers(REDIS_KEYS.PROMPT_HISTORY(roomCode));
+  }
+
+  /**
+   * Pulls the assigned room theme configuration from state, falling back to 'RANDOM'.
+   */
+  async getRoomTheme(roomCode: string): Promise<PromptTheme> {
+    const redis = this.redisService.getClient();
+
+    const roomState = await redis.hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
+    const theme = roomState.theme ?? 'RANDOM';
+
+    if (
+      theme !== 'ANIME' &&
+      theme !== 'CARTOON' &&
+      theme !== 'GAMING' &&
+      theme !== 'RANDOM'
+    ) {
+      return 'RANDOM';
+    }
+
+    return theme;
+  }
+
+  /**
+   * Selects an unplayed prompt based on the room theme, tracks it in history, and flags it as active.
+   */
+  async getUniquePrompt(roomCode: string): Promise<string> {
+    const redis = this.redisService.getClient();
+
+    const theme = await this.getRoomTheme(roomCode);
+    const usedPrompts = await this.getUsedPrompts(roomCode);
+
+    const availablePrompts = PROMPTS[theme].filter(
+      (prompt) => !usedPrompts.includes(prompt),
+    );
+
+    if (availablePrompts.length === 0) {
+      throw new Error(`Prompt pool exhausted for ${theme}`);
+    }
+
+    const randomIndex = Math.floor(Math.random() * availablePrompts.length);
+    const prompt = availablePrompts[randomIndex];
+
+    // Explicit validation step to reassure the TS compiler that 'prompt' is strictly a string
+    if (!prompt) {
+      throw new Error(`Failed to retrieve a valid prompt from the pool.`);
+    }
+
+    const pipeline = redis.pipeline();
+
+    pipeline.sadd(REDIS_KEYS.PROMPT_HISTORY(roomCode), prompt);
+    pipeline.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
+      activePrompt: prompt,
+    });
+
+    await pipeline.exec();
+
+    return prompt;
+  }
+
+  /**
+   * Directly mutates the room phase status property within the Redis room meta state hash.
+   */
+  async updateRoomStatus(roomCode: string, status: RoomStatus): Promise<void> {
+    const redis = this.redisService.getClient();
+
+    await redis.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
+      status,
+    });
+  }
+
+  /**
+   * Retrieves the current room status value string, defaulting back to LOBBY on non-existent properties.
+   */
+  async getRoomStatus(roomCode: string): Promise<RoomStatus> {
+    const redis = this.redisService.getClient();
+
+    const status = await redis.hget(REDIS_KEYS.ROOM_STATE(roomCode), 'status');
+
+    return (status as RoomStatus) ?? RoomStatus.LOBBY;
+  }
+
+  /**
+   * Cycles the target room status context forward to its chronologically adjacent game engine phase.
+   */
+  async advancePhase(roomCode: string): Promise<RoomStatus> {
+    const current = await this.getRoomStatus(roomCode);
+    let next: RoomStatus;
+
+    switch (current) {
+      case RoomStatus.LOBBY:
+        next = RoomStatus.DRAWING;
+        break;
+
+      case RoomStatus.DRAWING:
+        next = RoomStatus.GALLERY;
+        break;
+
+      case RoomStatus.GALLERY:
+        next = RoomStatus.ROUND_RESULTS;
+        break;
+
+      case RoomStatus.ROUND_RESULTS:
+        next = RoomStatus.FINAL_RESULTS;
+        break;
+
+      default:
+        next = RoomStatus.FINAL_RESULTS;
+    }
+
+    await this.updateRoomStatus(roomCode, next);
+    return next;
+  }
 
   /**
    * Updates dynamic match constraints and parameters inside the volatile Redis room meta hash.
@@ -185,7 +307,6 @@ export class GameService {
 
     const newHost = activePlayers[0];
 
-    // Explicitly check for both empty array and undefined element values to satisfy strict compilation
     if (!newHost) {
       await this.cleanupRoom(roomCode);
       return null;
@@ -231,7 +352,6 @@ export class GameService {
         ? Math.max(0, Math.ceil((endTimestamp - Date.now()) / 1000))
         : 0;
 
-    // Build standard, typed LeaderboardEntry schema matches using player data from our roster
     const leaderboard: LeaderboardEntry[] = roster.map((p) => ({
       playerId: p.playerId,
       username: p.username,
@@ -245,7 +365,7 @@ export class GameService {
       currentRound: Number(state.currentRound ?? 1),
       totalRounds: Number(state.totalRounds ?? 3),
       timerDuration: Number(state.timerDuration ?? 90),
-      theme: state.theme ?? 'Cartoon',
+      theme: (state.theme as PromptTheme) ?? 'RANDOM',
       remainingTime,
       activePrompt: state.activePrompt ?? null,
       leaderboard,

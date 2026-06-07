@@ -39,7 +39,6 @@ type AppSocket = Socket<any, any, any, CustomSocketData>;
 @WebSocketGateway({
   namespace: '/game',
   cors: {
-    // Splits multiple URLs if provided in .env, otherwise defaults to '*' for easy testing
     origin: process.env.FRONTEND_URL
       ? process.env.FRONTEND_URL.split(',')
       : '*',
@@ -88,12 +87,85 @@ export class GameGateway
   ): Promise<void> {
     const { roomCode } = client.data;
 
-    // 1. Commit changes to Redis via the central game engine service layer
     await this.gameService.updateRoomSettings(roomCode, dto);
 
-    // 2. Broadcast structural state sync event to all clients in the channel room
     this.server.to(roomCode).emit('v1:room:settings_changed', dto);
     this.server.to(roomCode).emit('v1:room:settings_updated', dto);
+  }
+
+  /**
+   * Validates room context eligibility and advances the room status state out of the LOBBY phase.
+   * Leverages a short-lived Redis NX lock to guarantee atomicity and prevent double-start race conditions.
+   */
+  @UseGuards(GatewayGuard)
+  @SubscribeMessage('v1:host:start_game')
+  async startGame(@ConnectedSocket() client: AppSocket): Promise<void> {
+    const { roomCode } = client.data;
+
+    // 1. Acquire distributed lock (5-second expiration window) to prevent rapid multi-clicks
+    const redisClient = this.redis.getClient();
+    const locked = await redisClient.set(
+      REDIS_KEYS.GAME_START_LOCK(roomCode),
+      '1',
+      'EX',
+      5,
+      'NX',
+    );
+
+    if (!locked) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'game_start_locked',
+          roomCode,
+          message:
+            'Game start execution dropped due to an active mutation lock.',
+        }),
+      );
+      return;
+    }
+
+    // 2. Validate current state status under full mutation isolation
+    const status = await this.gameService.getRoomStatus(roomCode);
+
+    if (status !== RoomStatus.LOBBY) {
+      return;
+    }
+
+    // 3. Commit state changes, advancing phase and initializing the round parameter structure
+    await redisClient.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
+      status: RoomStatus.DRAWING,
+      currentRound: '1',
+    });
+
+    // 4. Fetch a unique random prompt based on the room's chosen theme
+    const prompt = await this.gameService.getUniquePrompt(roomCode);
+
+    // 5. Broadcast phase transition and the initial round configuration
+    this.server.to(roomCode).emit('v1:game:phase_changed', {
+      roomCode,
+      status: RoomStatus.DRAWING,
+    });
+
+    this.server.to(roomCode).emit('v1:round:started', {
+      roomCode,
+      round: 1,
+      prompt,
+    });
+  }
+
+  /**
+   * Evaluates chronological state flow indices, shifting game rooms cleanly into structural adjacent loops.
+   */
+  @SubscribeMessage('v1:debug:advance_phase')
+  async advancePhase(@ConnectedSocket() client: AppSocket): Promise<void> {
+    const { roomCode } = client.data;
+
+    const next = await this.gameService.advancePhase(roomCode);
+
+    this.server.to(roomCode).emit('v1:game:phase_changed', {
+      roomCode,
+      status: next,
+    });
   }
 
   // ── Client Connection ─────────────────────────────────────────────────────────
@@ -119,7 +191,6 @@ export class GameGateway
         return;
       }
 
-      // ── Verify and decode JWT ──────────────────────────────────────────────
       let payload: JwtPayload;
       try {
         payload = jwt.verify(
@@ -137,7 +208,6 @@ export class GameGateway
 
       const { playerId, roomCode, isHost } = payload;
 
-      // ── Validate room exists ───────────────────────────────────────────────
       const metaKey = REDIS_KEYS.ROOM_META(roomCode);
       const roomExists = await this.redis.exists(metaKey);
       if (!roomExists) {
@@ -149,25 +219,20 @@ export class GameGateway
         return;
       }
 
-      // ── Bind tracking properties onto context data object layer ───────────
       client.data.playerId = playerId;
       client.data.roomCode = roomCode;
       client.data.isHost = isHost;
 
-      // ── Active Reconnection Logic Implementation ──────────────────────────
       const canReconnect = await this.gameService.canReconnect(playerId);
 
       if (canReconnect) {
-        // 1. Recover standard data fields directly from the primary player state block
         const playerHashKey = REDIS_KEYS.PLAYER_HASH(playerId);
         const existingPlayerRaw = await this.redis.hgetall(playerHashKey);
         client.data.username = existingPlayerRaw.username ?? 'Unknown';
 
-        // 2. Re-establish server memory mappings and sync pipeline states
         await this.gameService.markPlayerConnected(playerId);
         await client.join(roomCode);
 
-        // 3. Compile context matrices and deliver back down to client interface
         const snapshot = await this.gameService.buildReconnectSnapshot(
           roomCode,
           playerId,
@@ -184,7 +249,6 @@ export class GameGateway
           }),
         );
       } else {
-        // ── Fresh Connection Flow Process ───────────────────────────────────
         const reservationKey = REDIS_KEYS.RESERVATION(roomCode, playerId);
         const reservationRaw = await this.redis.get(reservationKey);
         let username = 'Unknown';
@@ -199,7 +263,6 @@ export class GameGateway
 
         client.data.username = username;
 
-        // Save entry allocations to storage cache layers
         await this.gameService.addPlayerToRoster(
           roomCode,
           playerId,
@@ -243,7 +306,6 @@ export class GameGateway
     if (!playerId || !roomCode) return;
 
     try {
-      // 1. Mark player offline and establish the temporary grace window in Redis
       await this.gameService.markPlayerDisconnected(playerId);
       await this.gameService.createReconnectWindow(playerId);
 
@@ -257,11 +319,8 @@ export class GameGateway
         }),
       );
 
-      // 2. Asynchronous Host Migration Orchestration Execution Path
       if (isHost) {
-        // Corrected signature signature to pass a standard synchronous callback to setTimeout
         setTimeout(() => {
-          // Wrap async business operational paths cleanly inside a standalone block
           const runMigration = async (): Promise<void> => {
             const stillDisconnected =
               !(await this.gameService.canReconnect(playerId));
@@ -288,7 +347,6 @@ export class GameGateway
             }
           };
 
-          // Execute async logic chain and securely trap untracked exceptions
           runMigration().catch((err) => {
             const message =
               err instanceof Error
@@ -302,13 +360,11 @@ export class GameGateway
               }),
             );
           });
-        }, 30000); // 30 seconds reconnect grace window matching your system cache defaults
+        }, 30000);
       }
 
-      // 3. Centralized validation guard checks for completely empty rooms
       await this.gameService.checkRoomOccupancy(roomCode);
 
-      // 4. Update remaining clients if the room was not dropped entirely
       const roster = await this.gameService.getRoomRoster(roomCode);
       if (roster.length > 0) {
         this.server

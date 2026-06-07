@@ -34,6 +34,9 @@ export const REDIS_KEYS = {
   TRANSITION_LOCK: (roomCode: string): string =>
     `sti:v1:room:${roomCode}:round-transition-lock`,
 
+  PROMPT_HISTORY: (roomCode: string) =>
+    `sti:v1:room:${roomCode}:prompt-history`,
+
   // ── Round-Level Keys ─────────────────────────────────────────────────────────
 
   /** Per-round state hash: prompt, galleryOrder, currentGalleryIndex */
