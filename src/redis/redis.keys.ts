@@ -34,7 +34,8 @@ export const REDIS_KEYS = {
   TRANSITION_LOCK: (roomCode: string): string =>
     `sti:v1:room:${roomCode}:round-transition-lock`,
 
-  PROMPT_HISTORY: (roomCode: string) =>
+  /** Prompt history reference array map for the active room session */
+  PROMPT_HISTORY: (roomCode: string): string =>
     `sti:v1:room:${roomCode}:prompt-history`,
 
   // ── Round-Level Keys ─────────────────────────────────────────────────────────
@@ -43,13 +44,25 @@ export const REDIS_KEYS = {
   ROUND_STATE: (roomCode: string, roundNumber: number): string =>
     `sti:v1:room:${roomCode}:round:${roundNumber}:state`,
 
-  /** Set of playerIds who have submitted a drawing this round */
+  /** * Set of playerIds who have submitted a drawing this round.
+   * Used directly for dynamic room completion checks.
+   */
   ROUND_SUBMITTED: (roomCode: string, roundNumber: number): string =>
     `sti:v1:room:${roomCode}:round:${roundNumber}:submitted`,
+
+  /** * Alternative format alias explicitly tracking round submission arrays.
+   * Conforms directly to concurrency lock specifications.
+   */
+  ROUND_SUBMITTED_SET: (roomCode: string, round: number): string =>
+    `sti:v1:room:${roomCode}:round:${round}:submitted`,
 
   /** Hash of drawingId → serialized vector stroke JSON — PRIMARY purge target */
   ROUND_DRAWINGS: (roomCode: string, roundNumber: number): string =>
     `sti:v1:room:${roomCode}:round:${roundNumber}:drawings`,
+
+  ROUND_TRANSITION_LOCK(roomCode: string): string {
+    return `sti:v1:room:${roomCode}:round-transition-lock`;
+  },
 
   // ── Player-Level Keys ────────────────────────────────────────────────────────
 
@@ -63,6 +76,12 @@ export const REDIS_KEYS = {
   /** Per-player submission lock — SETNX blocks double-submit within a round */
   PLAYER_SUBMISSION_LOCK: (playerId: string): string =>
     `sti:v1:player:${playerId}:submitted`,
+
+  /** * Highly granular per-round player submission lock tracker.
+   * Combines playerId and round parameters to reliably evaluate and stop race-condition double-submits.
+   */
+  SUBMISSION_LOCK: (playerId: string, round: number): string =>
+    `sti:v1:player:${playerId}:submitted:${round}`,
 
   // ── Scoring Keys ─────────────────────────────────────────────────────────────
 

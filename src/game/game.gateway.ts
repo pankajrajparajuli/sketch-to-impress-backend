@@ -122,19 +122,110 @@ export class GameGateway
 
     const currentRound = Number(roomState.currentRound ?? 1);
 
+    const redisClient = this.redis.getClient();
+
+    const lockKey = REDIS_KEYS.SUBMISSION_LOCK(playerId, currentRound);
+
+    const acquired = await redisClient.set(lockKey, '1', 'EX', 600, 'NX');
+
+    if (!acquired) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'duplicate_submission_blocked',
+          roomCode,
+          currentRound,
+          playerId,
+        }),
+      );
+
+      return {
+        success: false,
+        playerId,
+        strokeCount: 0,
+      };
+    }
+
     const drawingKey = `sti:v1:room:${roomCode}:round:${currentRound}:player:${playerId}`;
 
-    await this.redis.getClient().set(drawingKey, JSON.stringify(dto.strokes));
+    const submittedSet = REDIS_KEYS.ROUND_SUBMITTED_SET(roomCode, currentRound);
+
+    // Initialize atomic storage runtime pipeline grouping across storage boundaries
+    const pipeline = redisClient.pipeline();
+
+    pipeline.set(drawingKey, JSON.stringify(dto.strokes));
+
+    pipeline.sadd(submittedSet, playerId);
+
+    await pipeline.exec();
+
+    // Audit and process runtime submission indices for metrics logging
+    const submittedCount = await redisClient.scard(submittedSet);
 
     this.logger.log(
       JSON.stringify({
-        event: 'drawing_stored',
+        event: 'drawing_submitted',
         roomCode,
         currentRound,
         playerId,
-        strokeCount: dto.strokes.length,
+        submittedCount,
       }),
     );
+
+    // Filter roster to evaluate dynamic, connection-aware submission progress thresholds
+    const activePlayers = (
+      await this.gameService.getRoomRoster(roomCode)
+    ).filter((player) => player.connected);
+
+    const activePlayerCount = activePlayers.length;
+
+    if (submittedCount < activePlayerCount) {
+      return {
+        success: true,
+        playerId,
+        strokeCount: dto.strokes.length,
+      };
+    }
+
+    // Secure a short-lived distribution lock to prevent multi-client mutation race conditions
+    const transitionLockKey = REDIS_KEYS.ROUND_TRANSITION_LOCK(roomCode);
+
+    const transitionLock = await redisClient.set(
+      transitionLockKey,
+      '1',
+      'EX',
+      5,
+      'NX',
+    );
+
+    if (!transitionLock) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'transition_lock_blocked',
+          roomCode,
+          currentRound,
+          playerId,
+        }),
+      );
+
+      return {
+        success: true,
+        playerId,
+        strokeCount: dto.strokes.length,
+      };
+    }
+
+    // Final player submitted under lock security -> Trigger downstream phase advancement execution
+    this.logger.log(
+      JSON.stringify({
+        event: 'all_players_submitted',
+        roomCode,
+        currentRound,
+        submittedCount,
+        activePlayerCount,
+      }),
+    );
+
+    await this.gameService.advancePhase(roomCode);
 
     return {
       success: true,
