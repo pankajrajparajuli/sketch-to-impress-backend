@@ -97,7 +97,6 @@ export class GameGateway
 
     let index = 0;
 
-    // Fixed: Callback is now synchronous to satisfy setInterval's signature and prevent unhandled promise drops
     const timer = setInterval(() => {
       const drawing = gallery[index];
 
