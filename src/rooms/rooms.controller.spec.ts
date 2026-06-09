@@ -19,7 +19,7 @@ describe('RoomsController', () => {
       providers: [
         {
           provide: RoomsService,
-          useValue: mockRoomsService as unknown as RoomsService,
+          useValue: mockRoomsService,
         },
       ],
     }).compile();

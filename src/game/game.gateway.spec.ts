@@ -20,7 +20,9 @@ describe('GameGateway', () => {
   let mockHget: ReturnType<
     typeof jest.fn<(key: string, field: string) => Promise<string | null>>
   >;
-  let mockGet: ReturnType<typeof jest.fn<(key: string) => Promise<string | null>>>;
+  let mockGet: ReturnType<
+    typeof jest.fn<(key: string) => Promise<string | null>>
+  >;
   let mockDel: ReturnType<typeof jest.fn<(...keys: string[]) => Promise<void>>>;
   let mockTouchRoom: ReturnType<
     typeof jest.fn<(roomCode: string, currentRound: number) => Promise<void>>
@@ -80,11 +82,11 @@ describe('GameGateway', () => {
         GameGateway,
         {
           provide: RedisService,
-          useValue: mockRedisService as unknown as RedisService,
+          useValue: mockRedisService,
         },
         {
           provide: GameService,
-          useValue: mockGameService as unknown as GameService,
+          useValue: mockGameService,
         },
       ],
     }).compile();
@@ -116,7 +118,10 @@ describe('GameGateway', () => {
 
       await gateway.updateSettings(mockClient, dto);
 
-      expect(gameService.updateRoomSettings).toHaveBeenCalledWith('ABCDEF', dto);
+      expect(gameService.updateRoomSettings).toHaveBeenCalledWith(
+        'ABCDEF',
+        dto,
+      );
       expect(mockServerTo).toHaveBeenCalledWith('ABCDEF');
       expect(mockToEmit).toHaveBeenCalledWith('v1:room:settings_changed', dto);
       expect(mockToEmit).toHaveBeenCalledWith('v1:room:settings_updated', dto);
@@ -252,7 +257,12 @@ describe('GameGateway', () => {
       mockAddPlayerToRoster.mockResolvedValue(undefined);
 
       const mockRoster = [
-        { playerId: 'usr_1', username: 'NewPlayer', isHost: false, connected: true },
+        {
+          playerId: 'usr_1',
+          username: 'NewPlayer',
+          isHost: false,
+          connected: true,
+        },
       ];
       mockGetRoomRoster.mockResolvedValue(mockRoster);
 
@@ -329,7 +339,12 @@ describe('GameGateway', () => {
 
       mockAddPlayerToRoster.mockResolvedValue(undefined);
       const mockRoster = [
-        { playerId: 'usr_1', username: 'ReconnectingPlayer', isHost: false, connected: true },
+        {
+          playerId: 'usr_1',
+          username: 'ReconnectingPlayer',
+          isHost: false,
+          connected: true,
+        },
       ];
       mockGetRoomRoster.mockResolvedValue(mockRoster);
 
@@ -342,19 +357,22 @@ describe('GameGateway', () => {
         isHost: false,
       });
 
-      expect(mockClientEmit).toHaveBeenCalledWith('v1:player:reconnected', expect.objectContaining({
-        roomCode: 'ABCDEF',
-        playerId: 'usr_1',
-        phase: RoomStatus.LOBBY,
-        currentRound: 1,
-        totalRounds: 3,
-        timerDuration: 90,
-        theme: 'Cartoon',
-        leaderboard: [
-          { playerId: 'usr_1', username: 'ReconnectingPlayer', stars: 10 },
-        ],
-        players: mockRoster,
-      }));
+      expect(mockClientEmit).toHaveBeenCalledWith(
+        'v1:player:reconnected',
+        expect.objectContaining({
+          roomCode: 'ABCDEF',
+          playerId: 'usr_1',
+          phase: RoomStatus.LOBBY,
+          currentRound: 1,
+          totalRounds: 3,
+          timerDuration: 90,
+          theme: 'Cartoon',
+          leaderboard: [
+            { playerId: 'usr_1', username: 'ReconnectingPlayer', stars: 10 },
+          ],
+          players: mockRoster,
+        }),
+      );
     });
   });
 
@@ -381,7 +399,11 @@ describe('GameGateway', () => {
       await gateway.handleDisconnect(mockClient);
 
       expect(mockExists).toHaveBeenCalledWith(REDIS_KEYS.PLAYER_HASH('usr_1'));
-      expect(mockHset).toHaveBeenCalledWith(REDIS_KEYS.PLAYER_HASH('usr_1'), 'connected', 'false');
+      expect(mockHset).toHaveBeenCalledWith(
+        REDIS_KEYS.PLAYER_HASH('usr_1'),
+        'connected',
+        'false',
+      );
       expect(mockServerTo).toHaveBeenCalledWith('ABCDEF');
       expect(mockToEmit).toHaveBeenCalledWith('v1:room:roster_updated', {
         players: mockRoster,
@@ -410,7 +432,11 @@ describe('GameGateway', () => {
       await gateway.handleDisconnect(mockClient);
 
       expect(mockExists).toHaveBeenCalledWith(REDIS_KEYS.PLAYER_HASH('usr_1'));
-      expect(mockHset).toHaveBeenCalledWith(REDIS_KEYS.PLAYER_HASH('usr_1'), 'connected', 'false');
+      expect(mockHset).toHaveBeenCalledWith(
+        REDIS_KEYS.PLAYER_HASH('usr_1'),
+        'connected',
+        'false',
+      );
       expect(mockDel).toHaveBeenCalledWith(
         REDIS_KEYS.ROOM_META('ABCDEF'),
         REDIS_KEYS.ROOM_PLAYERS('ABCDEF'),
@@ -432,7 +458,7 @@ describe('GameGateway', () => {
       // Instantiate your guard manually or via execution context mock to ensure it blocks
       const { GatewayGuard } = require('../common/guards/gateway.guard');
       const guard = new GatewayGuard();
-      
+
       const mockContext = {
         switchToWs: () => ({
           getClient: () => mockClient,
@@ -450,11 +476,15 @@ describe('GameGateway', () => {
       } as any;
 
       // Triggering connection rejection pipeline directly
-      (gateway as any).rejectClient(mockClient, 'AUTH_FAILED', 'Invalid token structural hash');
+      (gateway as any).rejectClient(
+        mockClient,
+        'AUTH_FAILED',
+        'Invalid token structural hash',
+      );
 
       expect(mockClient.emit).toHaveBeenCalledWith(
         'error:exception',
-        expect.objectContaining({ code: 'AUTH_FAILED' })
+        expect.objectContaining({ code: 'AUTH_FAILED' }),
       );
       expect(mockClient.disconnect).toHaveBeenCalledWith(true);
     });

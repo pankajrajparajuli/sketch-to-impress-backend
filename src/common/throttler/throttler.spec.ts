@@ -41,7 +41,7 @@ describe('Throttler Components', () => {
         RedisThrottlerStorage,
         {
           provide: RedisService,
-          useValue: mockRedisService as unknown as RedisService,
+          useValue: mockRedisService,
         },
       ],
     }).compile();
