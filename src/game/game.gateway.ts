@@ -59,6 +59,7 @@ export class GameGateway
   server!: Server;
 
   private readonly logger = new Logger(GameGateway.name);
+  private readonly galleryTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(
     private readonly redis: RedisService,
@@ -81,6 +82,42 @@ export class GameGateway
         namespace: '/game',
       }),
     );
+  }
+
+  private async startGalleryCarousel(
+    roomCode: string,
+    round: number,
+  ): Promise<void> {
+    const gallery = await this.gameService.getGalleryOrder(roomCode, round);
+
+    if (gallery.length === 0) {
+      await this.gameService.advancePhase(roomCode);
+      return;
+    }
+
+    let index = 0;
+
+    // Fixed: Callback is now synchronous to satisfy setInterval's signature and prevent unhandled promise drops
+    const timer = setInterval(() => {
+      const drawing = gallery[index];
+
+      this.server.to(roomCode).emit('v1:gallery:next_canvas', {
+        roomCode,
+        round,
+        position: index + 1,
+        total: gallery.length,
+        drawing,
+      });
+
+      index++;
+
+      if (index >= gallery.length) {
+        clearInterval(timer);
+        this.galleryTimers.delete(roomCode);
+      }
+    }, 12000);
+
+    this.galleryTimers.set(roomCode, timer);
   }
 
   // ── WebSocket Ingestion Pipeline Event Listeners ─────────────────────────────
@@ -121,11 +158,8 @@ export class GameGateway
     }
 
     const currentRound = Number(roomState.currentRound ?? 1);
-
     const redisClient = this.redis.getClient();
-
     const lockKey = REDIS_KEYS.SUBMISSION_LOCK(playerId, currentRound);
-
     const acquired = await redisClient.set(lockKey, '1', 'EX', 600, 'NX');
 
     if (!acquired) {
@@ -146,16 +180,12 @@ export class GameGateway
     }
 
     const drawingKey = `sti:v1:room:${roomCode}:round:${currentRound}:player:${playerId}`;
-
     const submittedSet = REDIS_KEYS.ROUND_SUBMITTED_SET(roomCode, currentRound);
 
     // Initialize atomic storage runtime pipeline grouping across storage boundaries
     const pipeline = redisClient.pipeline();
-
     pipeline.set(drawingKey, JSON.stringify(dto.strokes));
-
     pipeline.sadd(submittedSet, playerId);
-
     await pipeline.exec();
 
     // Audit and process runtime submission indices for metrics logging
@@ -188,7 +218,6 @@ export class GameGateway
 
     // Secure a short-lived distribution lock to prevent multi-client mutation race conditions
     const transitionLockKey = REDIS_KEYS.ROUND_TRANSITION_LOCK(roomCode);
-
     const transitionLock = await redisClient.set(
       transitionLockKey,
       '1',
@@ -232,11 +261,9 @@ export class GameGateway
       currentRound,
     );
 
-    this.server.to(roomCode).emit('v1:gallery:started', {
-      roomCode,
-      round: currentRound,
-      gallery,
-    });
+    await this.gameService.cacheGalleryOrder(roomCode, currentRound, gallery);
+
+    await this.startGalleryCarousel(roomCode, currentRound);
 
     return {
       success: true,
@@ -359,11 +386,9 @@ export class GameGateway
         roundNumber,
       );
 
-      this.server.to(roomCode).emit('v1:gallery:started', {
-        roomCode,
-        round: roundNumber,
-        gallery,
-      });
+      await this.gameService.cacheGalleryOrder(roomCode, roundNumber, gallery);
+
+      await this.startGalleryCarousel(roomCode, roundNumber);
     }
   }
 

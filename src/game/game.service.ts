@@ -42,6 +42,31 @@ export class GameService {
     this.phaseTimers.delete(roomCode);
   }
 
+  async cacheGalleryOrder(
+    roomCode: string,
+    round: number,
+    gallery: GalleryEntry[],
+  ): Promise<void> {
+    await this.redisService
+      .getClient()
+      .set(REDIS_KEYS.GALLERY_ORDER(roomCode, round), JSON.stringify(gallery));
+  }
+
+  async getGalleryOrder(
+    roomCode: string,
+    round: number,
+  ): Promise<GalleryEntry[]> {
+    const raw = await this.redisService
+      .getClient()
+      .get(REDIS_KEYS.GALLERY_ORDER(roomCode, round));
+
+    if (!raw) {
+      return [];
+    }
+
+    return JSON.parse(raw) as GalleryEntry[];
+  }
+
   async schedulePhaseTransition(
     roomCode: string,
     durationSeconds: number,

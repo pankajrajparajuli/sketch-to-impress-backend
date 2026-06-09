@@ -64,6 +64,11 @@ export const REDIS_KEYS = {
     return `sti:v1:room:${roomCode}:round-transition-lock`;
   },
 
+  /** Array/List containing the randomized sequence of drawings for presentation */
+  GALLERY_ORDER(roomCode: string, round: number): string {
+    return `sti:v1:room:${roomCode}:round:${round}:gallery-order`;
+  },
+
   // ── Player-Level Keys ────────────────────────────────────────────────────────
 
   /** Player connection/state tracking hash */
