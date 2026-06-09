@@ -227,6 +227,17 @@ export class GameGateway
 
     await this.gameService.advancePhase(roomCode);
 
+    const gallery = await this.gameService.buildGalleryPayload(
+      roomCode,
+      currentRound,
+    );
+
+    this.server.to(roomCode).emit('v1:gallery:started', {
+      roomCode,
+      round: currentRound,
+      gallery,
+    });
+
     return {
       success: true,
       playerId,
@@ -335,8 +346,23 @@ export class GameGateway
     if (next === RoomStatus.DRAWING && prompt) {
       this.server.to(roomCode).emit('v1:round:started', {
         roomCode,
-        round: currentRound,
+        round: currentRound ?? 1,
         prompt,
+      });
+    }
+
+    if (next === RoomStatus.GALLERY) {
+      const roundNumber = currentRound ?? 1;
+
+      const gallery = await this.gameService.buildGalleryPayload(
+        roomCode,
+        roundNumber,
+      );
+
+      this.server.to(roomCode).emit('v1:gallery:started', {
+        roomCode,
+        round: roundNumber,
+        gallery,
       });
     }
   }

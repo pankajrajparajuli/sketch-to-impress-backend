@@ -10,6 +10,9 @@ import { RoomStatus } from '../rooms/enums/room-status.enum';
 import { PROMPTS, PromptTheme } from './constants/prompts';
 import { GAME_TIMERS } from './constants/game-timers';
 
+import { randomUUID } from 'crypto';
+import { GalleryEntry } from './interfaces/gallery-entry.interface';
+
 const RECONNECT_GRACE_SECONDS = 30;
 
 @Injectable()
@@ -388,5 +391,33 @@ export class GameService {
       leaderboard,
       players: roster,
     };
+  }
+
+  async buildGalleryPayload(
+    roomCode: string,
+    round: number,
+  ): Promise<GalleryEntry[]> {
+    const redisClient = this.redisService.getClient();
+
+    const drawingKeys = await redisClient.keys(
+      `sti:v1:room:${roomCode}:round:${round}:player:*`,
+    );
+
+    const gallery: GalleryEntry[] = [];
+
+    for (const key of drawingKeys) {
+      const strokes = await redisClient.get(key);
+
+      if (!strokes) {
+        continue;
+      }
+
+      gallery.push({
+        drawingId: randomUUID(),
+        strokes,
+      });
+    }
+
+    return gallery.sort(() => Math.random() - 0.5);
   }
 }
