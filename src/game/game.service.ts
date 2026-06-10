@@ -42,6 +42,33 @@ export class GameService {
     this.phaseTimers.delete(roomCode);
   }
 
+  // ─── GALLERY INDEX REDIS PERSISTENCE HELPERS (SPRINT 24 PART 1) ───────────
+
+  async getGalleryIndex(roomCode: string, round: number): Promise<number> {
+    const raw = await this.redisService
+      .getClient()
+      .get(REDIS_KEYS.GALLERY_INDEX(roomCode, round));
+    return Number(raw ?? 0);
+  }
+
+  async setGalleryIndex(
+    roomCode: string,
+    round: number,
+    index: number,
+  ): Promise<void> {
+    await this.redisService
+      .getClient()
+      .set(REDIS_KEYS.GALLERY_INDEX(roomCode, round), index.toString());
+  }
+
+  async deleteGalleryIndex(roomCode: string, round: number): Promise<void> {
+    await this.redisService
+      .getClient()
+      .del(REDIS_KEYS.GALLERY_INDEX(roomCode, round));
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+
   async cacheGalleryOrder(
     roomCode: string,
     round: number,

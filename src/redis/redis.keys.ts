@@ -96,6 +96,18 @@ export const REDIS_KEYS = {
 
   // ── Gallery Voting Keys ──────────────────────────────────────────────────────
 
+  GALLERY_INDEX(roomCode: string, round: number): string {
+    return `sti:v1:room:${roomCode}:round:${round}:gallery-index`;
+  },
+
+  GALLERY_ADVANCE_LOCK(
+    roomCode: string,
+    round: number,
+    drawingId: string,
+  ): string {
+    return `sti:v1:room:${roomCode}:round:${round}:drawing:${drawingId}:gallery-lock`;
+  },
+
   /** Per-drawing voter set — tracks which playerIds have cast a star rating */
   VOTERS(roomCode: string, round: number, drawingId: string): string {
     return `sti:v1:room:${roomCode}:round:${round}:drawing:${drawingId}:voters`;

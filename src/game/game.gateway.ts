@@ -13,6 +13,7 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
+import { OnEvent } from '@nestjs/event-emitter';
 import * as jwt from 'jsonwebtoken';
 import { Server, Socket } from 'socket.io';
 
@@ -123,7 +124,8 @@ export class GameGateway
       return;
     }
 
-    let index = 0;
+    // LOAD PREVIOUS STATE FROM REDIS INSTANCE INSTEAD OF INITIALIZING TO 0
+    let index = await this.gameService.getGalleryIndex(roomCode, round);
     const redisClient = this.redis.getClient();
 
     const runCarouselStep = async () => {
@@ -133,6 +135,8 @@ export class GameGateway
           REDIS_KEYS.ROOM_STATE(roomCode),
           'activeDrawingId',
         );
+        // CLEAN UP THE GALLERY INDEX ON COMPLETED CAROUSEL LOOP
+        await this.gameService.deleteGalleryIndex(roomCode, round);
         await this.gameService.advancePhase(roomCode);
         return;
       }
@@ -145,6 +149,7 @@ export class GameGateway
           REDIS_KEYS.ROOM_STATE(roomCode),
           'activeDrawingId',
         );
+        await this.gameService.deleteGalleryIndex(roomCode, round);
         await this.gameService.advancePhase(roomCode);
         return;
       }
@@ -159,9 +164,6 @@ export class GameGateway
         activeDrawingId: targetDrawingId,
       });
 
-      // ─── TYPE-SAFE ANONYMITY MAP ───────────────────────────────────────────
-      // Explicitly map properties into a new object to omit 'playerId'.
-      // This completely avoids ESLint's unused variable rule warnings.
       const anonymousDrawing = {
         drawingId: safeDrawing.drawingId,
         strokes: safeDrawing.strokes,
@@ -176,7 +178,9 @@ export class GameGateway
         votingSeconds: GAME_TIMERS.VOTING_SECONDS_PER_CANVAS,
       });
 
+      // INCREMENT AND IMMEDIATELY UPDATE REDIS
       index++;
+      await this.gameService.setGalleryIndex(roomCode, round, index);
 
       const timer = setTimeout(() => {
         runCarouselStep().catch((err: unknown) => {
@@ -189,6 +193,147 @@ export class GameGateway
     };
 
     await runCarouselStep();
+  }
+
+  // HANDLERS FOR EXTERNAL DISCONNECTIONS DURING GALLERY PHASE TO RECALCULATE VOTER MAJORITY AND ADVANCE CAROUSEL IF NEEDED
+
+  private async checkGalleryCompletion(
+    roomCode: string,
+    currentRound: number,
+    drawingId: string,
+  ): Promise<boolean> {
+    const redisClient = this.redis.getClient();
+
+    const gallery = await this.gameService.getGalleryOrder(
+      roomCode,
+      currentRound,
+    );
+    const safeGallery = gallery as unknown as ExtendedGalleryEntry[];
+
+    const drawing = safeGallery.find((g) => g.drawingId === drawingId);
+    if (!drawing) {
+      return false;
+    }
+
+    const roster = await this.gameService.getRoomRoster(roomCode);
+
+    // Filter out the artist from the baseline calculation
+    const eligibleVoters = roster.filter(
+      (player) => player.playerId !== drawing.playerId,
+    ).length;
+
+    const completedVoters = await redisClient.scard(
+      REDIS_KEYS.VOTERS(roomCode, currentRound, drawingId),
+    );
+
+    this.logger.log(
+      JSON.stringify({
+        event: 'gallery_vote_progress',
+        roomCode,
+        currentRound,
+        drawingId,
+        eligibleVoters,
+        completedVoters,
+      }),
+    );
+
+    return completedVoters >= eligibleVoters;
+  }
+
+  private async handleGalleryDisconnect(roomCode: string): Promise<void> {
+    const redisClient = this.redis.getClient();
+
+    const roomState = await redisClient.hgetall(
+      REDIS_KEYS.ROOM_STATE(roomCode),
+    );
+
+    if (roomState.status !== RoomStatus.GALLERY) {
+      return;
+    }
+
+    const activeDrawingId = roomState.activeDrawingId;
+
+    if (!activeDrawingId) {
+      return;
+    }
+
+    const currentRound = Number(roomState.currentRound ?? 1);
+
+    const complete = await this.checkGalleryCompletion(
+      roomCode,
+      currentRound,
+      activeDrawingId,
+    );
+
+    if (!complete) {
+      return;
+    }
+
+    // Race Condition Protection: Check atomic mutation lock
+    const lockKey = REDIS_KEYS.GALLERY_ADVANCE_LOCK(
+      roomCode,
+      currentRound,
+      activeDrawingId,
+    );
+
+    const lock = await redisClient.set(lockKey, '1', 'EX', 5, 'NX');
+
+    if (!lock) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'gallery_advance_lock_blocked',
+          roomCode,
+          currentRound,
+          drawingId: activeDrawingId,
+          context: 'handleGalleryDisconnect',
+        }),
+      );
+      return;
+    }
+
+    this.logger.log(
+      JSON.stringify({
+        event: 'gallery_disconnect_recalculation',
+        roomCode,
+        currentRound,
+        drawingId: activeDrawingId,
+      }),
+    );
+
+    await this.advanceGalleryCanvas(roomCode, currentRound);
+  }
+
+  // HANDLERS FOR EXTERNAL DISCONNECTIONS DURING GALLERY PHASE TO RECALCULATE VOTER MAJORITY AND ADVANCE CAROUSEL IF NEEDED
+
+  @OnEvent('PLAYER_LEFT')
+  async handlePlayerLeftEvent(payload: {
+    roomCode: string;
+    playerId: string;
+  }): Promise<void> {
+    this.logger.log(
+      JSON.stringify({
+        event: 'player_left_event_received',
+        roomCode: payload.roomCode,
+        playerId: payload.playerId,
+        message:
+          'Decoupled event listener intercepting room disconnection for dynamic recalculation.',
+      }),
+    );
+    await this.handleGalleryDisconnect(payload.roomCode);
+  }
+
+  private async advanceGalleryCanvas(
+    roomCode: string,
+    round: number,
+  ): Promise<void> {
+    const timer = this.galleryTimers.get(roomCode);
+
+    if (timer) {
+      clearTimeout(timer);
+      this.galleryTimers.delete(roomCode);
+    }
+
+    await this.startGalleryCarousel(roomCode, round);
   }
 
   // ── WebSocket Ingestion Pipeline Event Listeners ─────────────────────────────
@@ -364,6 +509,32 @@ export class GameGateway
       activeDrawingId,
     );
 
+    const gallery = await this.gameService.getGalleryOrder(
+      roomCode,
+      currentRound,
+    );
+
+    const safeGallery = gallery as unknown as ExtendedGalleryEntry[];
+    const targetItem = safeGallery.find((g) => g.drawingId === activeDrawingId);
+    if (!targetItem) {
+      return { success: false };
+    }
+
+    // 1. VALIDATION BARRIER: Block out self-voters before any state mutation
+    if (targetItem.playerId === playerId) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'self_vote_blocked',
+          roomCode,
+          currentRound,
+          drawingId: activeDrawingId,
+          playerId,
+        }),
+      );
+      return { success: false };
+    }
+
+    // 2. STATE MUTATION: Try adding voter to set safely
     const added = await redisClient.sadd(votersKey, playerId);
 
     if (added === 0) {
@@ -376,36 +547,10 @@ export class GameGateway
           playerId,
         }),
       );
-
       return { success: false };
     }
 
-    const gallery = await this.gameService.getGalleryOrder(
-      roomCode,
-      currentRound,
-    );
-
-    const safeGallery = gallery as unknown as ExtendedGalleryEntry[];
-    const targetItem = safeGallery.find((g) => g.drawingId === activeDrawingId);
-    if (!targetItem) {
-      return { success: false };
-    }
-
-    if (targetItem.playerId === playerId) {
-      this.logger.warn(
-        JSON.stringify({
-          event: 'self_vote_blocked',
-          roomCode,
-          currentRound,
-          drawingId: activeDrawingId,
-          playerId,
-        }),
-      );
-
-      return {
-        success: false,
-      };
-    }
+    // 3. PERSIST SCORES AND LOG REWARDS
     if (targetItem && targetItem.playerId) {
       const leaderboardKey = REDIS_KEYS.LEADERBOARD(roomCode);
       await redisClient.hincrby(leaderboardKey, targetItem.playerId, dto.stars);
@@ -421,6 +566,48 @@ export class GameGateway
         stars: dto.stars,
       }),
     );
+
+    // ─── EARLY ADVANCE CHECKS ───────────────────────────────
+    const complete = await this.checkGalleryCompletion(
+      roomCode,
+      currentRound,
+      activeDrawingId,
+    );
+
+    if (complete) {
+      const lockKey = REDIS_KEYS.GALLERY_ADVANCE_LOCK(
+        roomCode,
+        currentRound,
+        activeDrawingId,
+      );
+
+      const lock = await redisClient.set(lockKey, '1', 'EX', 5, 'NX');
+
+      if (!lock) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'gallery_advance_lock_blocked',
+            roomCode,
+            currentRound,
+            drawingId: activeDrawingId,
+            context: 'castVote',
+          }),
+        );
+
+        return { success: true };
+      }
+
+      this.logger.log(
+        JSON.stringify({
+          event: 'gallery_early_advance',
+          roomCode,
+          currentRound,
+          drawingId: activeDrawingId,
+        }),
+      );
+
+      await this.advanceGalleryCanvas(roomCode, currentRound);
+    }
 
     return { success: true };
   }
