@@ -132,6 +132,14 @@ export class GameGateway
     const gallery = await this.gameService.getGalleryOrder(roomCode, round);
 
     if (gallery.length === 0) {
+      const standings = await this.gameService.buildRoundStandings(roomCode);
+
+      this.server.to(roomCode).emit('v1:game:round_complete', {
+        roomCode,
+        round,
+        standings,
+      });
+
       await this.gameService.advancePhase(roomCode);
       return;
     }
@@ -162,6 +170,13 @@ export class GameGateway
           'activeDrawingId',
         );
         await this.gameService.deleteGalleryIndex(roomCode, round);
+        const standings = await this.gameService.buildRoundStandings(roomCode);
+        this.server.to(roomCode).emit('v1:game:round_complete', {
+          roomCode,
+          round,
+          standings,
+        });
+
         await this.gameService.advancePhase(roomCode);
         return;
       }

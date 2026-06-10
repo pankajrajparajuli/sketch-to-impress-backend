@@ -12,6 +12,7 @@ import { GAME_TIMERS } from './constants/game-timers';
 
 import { randomUUID } from 'crypto';
 import { GalleryEntry } from './interfaces/v1-gallery-entry.interface';
+import { RoundResultEntry } from './interfaces/v1-round-results.interface';
 
 const RECONNECT_GRACE_SECONDS = 30;
 
@@ -511,5 +512,27 @@ export class GameService {
     }
 
     return gallery;
+  }
+
+  // Helpful utility for compiling round standings in both ROUND_RESULTS and FINAL_RESULTS phases
+  async buildRoundStandings(roomCode: string): Promise<RoundResultEntry[]> {
+    const redis = this.redisService.getClient();
+
+    const leaderboard = await redis.hgetall(REDIS_KEYS.LEADERBOARD(roomCode));
+
+    const roster = await this.getRoomRoster(roomCode);
+
+    const standings = roster.map((player) => ({
+      playerId: player.playerId,
+      username: player.username,
+      score: Number(leaderboard[player.playerId] ?? 0),
+    }));
+
+    standings.sort((a, b) => b.score - a.score);
+
+    return standings.map((entry, index) => ({
+      ...entry,
+      rank: index + 1,
+    }));
   }
 }
