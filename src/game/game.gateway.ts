@@ -1,5 +1,6 @@
 import { SubmitDrawingDto } from './dto/submit-drawing.dto';
 import { CastVoteDto } from './dto/cast-vote.dto';
+import { PlayAgainDto } from './dto/play-again.dto';
 import { validateDrawingPayloadSize } from './validators/drawing-payload.validator';
 import { validateVectorOnlyPayload } from './validators/drawing-content.validator';
 import { Logger, UseGuards, UsePipes, ValidationPipe } from '@nestjs/common';
@@ -124,7 +125,7 @@ export class GameGateway
               serverTime: Date.now(),
             });
           } else if (status === RoomStatus.FINAL_RESULTS) {
-            // 🛠️ Integrates cumulative match results and emits podium state downstream
+            // Integrates cumulative match results and emits podium state downstream
             const results = await this.gameService.buildMatchResults(roomCode);
 
             this.server.to(roomCode).emit('v1:game:match_over', results);
@@ -762,6 +763,68 @@ export class GameGateway
   async advancePhase(@ConnectedSocket() client: AppSocket): Promise<void> {
     const { roomCode } = client.data;
     await this.gameService.advancePhase(roomCode);
+  }
+
+  // ─── SPRINT 29: MATCH RESET ENGINE ──────────────────────────────────────────
+
+  @UsePipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: true,
+    }),
+  )
+  @SubscribeMessage('v1:host:trigger_play_again')
+  async triggerPlayAgain(
+    @ConnectedSocket() client: AppSocket,
+    @MessageBody() dto: PlayAgainDto,
+  ): Promise<{ success: boolean }> {
+    const { roomCode, playerId } = client.data;
+
+    if (dto.confirm !== true) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'match_lobby_reset_rejected',
+          roomCode,
+          playerId,
+          reason: 'Explicit confirmation handshake flag was missing or false.',
+        }),
+      );
+      return { success: false };
+    }
+
+    try {
+      // 1. Run multi/exec transaction sequence inside the service layer
+      await this.gameService.resetMatch(roomCode, playerId);
+
+      // 2. Transmit lobby downgrade event to return clients instantly to lobby layouts
+      this.server.to(roomCode).emit('v1:game:lobby_reset', {
+        roomCode,
+        status: RoomStatus.LOBBY,
+      });
+
+      this.logger.log(
+        JSON.stringify({
+          event: 'match_lobby_reset_success',
+          roomCode,
+          triggeredBy: playerId,
+        }),
+      );
+
+      return { success: true };
+    } catch (err: unknown) {
+      const errMsg =
+        err instanceof Error ? err.message : 'Reset operation error.';
+      this.logger.error(
+        JSON.stringify({
+          event: 'match_lobby_reset_failed',
+          roomCode,
+          playerId,
+          error: errMsg,
+        }),
+      );
+      throw err;
+    }
   }
 
   // ── Client Connection ─────────────────────────────────────────────────────────
