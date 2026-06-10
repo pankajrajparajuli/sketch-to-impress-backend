@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { RedisService } from '../redis/redis.service';
 import { REDIS_KEYS } from '../redis/redis.keys';
 import { RoomPlayer } from './interfaces/v1-room-player.interface';
@@ -17,12 +17,13 @@ import { CleanupService } from '../common/services/cleanup.service';
 import {
   FinalResultEntry,
   MatchOverPayload,
-} from './interfaces/v1-final-result.interface'; // Adjust path if needed
+} from './interfaces/v1-final-result.interface';
 
 const RECONNECT_GRACE_SECONDS = 30;
 
 @Injectable()
 export class GameService {
+  private readonly logger = new Logger(GameService.name);
   private readonly phaseTimers = new Map<string, NodeJS.Timeout>();
 
   // Define the private callback property
@@ -121,9 +122,8 @@ export class GameService {
       this.handlePhaseTimeout(roomCode).catch((err: unknown) => {
         const errorMessage =
           err instanceof Error ? err.message : 'Unknown phase timeout error';
-        console.error(
-          `[GameService] Phase timeout failure for room ${roomCode}:`,
-          errorMessage,
+        this.logger.error(
+          `Phase timeout failure for room ${roomCode}: ${errorMessage}`,
         );
       });
     }, durationSeconds * 1000);
@@ -263,7 +263,6 @@ export class GameService {
         next = RoomStatus.ROUND_RESULTS;
 
         // 🛠️ Hook #1 — ROUND_RESULTS Entry
-        // Instantly and aggressively reclaims canvas memory across the roster.
         const targetRound = Number(state.currentRound ?? 1);
         await this.cleanupService.cleanupRoundStrokes(
           roomCode,
@@ -304,11 +303,10 @@ export class GameService {
       );
     }
 
-    // Fires synchronous gateway handling loop (transmits final score data downstream)
+    // Fires synchronous gateway handling loop
     this.phaseChangeCallback?.(roomCode, next);
 
     // 🛠️ Hook #2 — FINAL_RESULTS Delay
-    // Reclaims match data cleanly after clients read podium snapshots.
     if (next === RoomStatus.FINAL_RESULTS) {
       const gracePeriodSeconds = 30; // 30-second safe buffer for client UI rendering
       setTimeout(() => {
@@ -317,9 +315,8 @@ export class GameService {
           .catch((err: unknown) => {
             const errorMessage =
               err instanceof Error ? err.message : 'Unknown cleanup error';
-            console.error(
-              `[GameService] Deterministic cleanup failure for room ${roomCode}:`,
-              errorMessage,
+            this.logger.error(
+              `Deterministic cleanup failure for room ${roomCode}: ${errorMessage}`,
             );
           });
       }, gracePeriodSeconds * 1000);
@@ -601,5 +598,78 @@ export class GameService {
       podium: standings.slice(0, 3),
       standings,
     };
+  }
+
+  // ─── SPRINT 29 MATCH RESET & TRANSACTION SAFETY ENGINE ──────────────────────
+
+  private async validateHost(
+    roomCode: string,
+    playerId: string,
+  ): Promise<void> {
+    const redis = this.redisService.getClient();
+    const meta = await redis.hgetall(REDIS_KEYS.ROOM_META(roomCode));
+
+    if (meta.hostId !== playerId) {
+      throw new Error('Only host may restart match.');
+    }
+  }
+
+  /**
+   * Performs an all-or-nothing multi/exec transactional reset of the game instance
+   * metadata, historical prompts, round structures, and active transition blocks.
+   * Player connection footprints remain cleanly preserved throughout this layout downgrade.
+   */
+  async resetMatch(roomCode: string, hostPlayerId: string): Promise<void> {
+    await this.validateHost(roomCode, hostPlayerId);
+
+    // Cancel any pending phase transition set timeouts to avoid post-reset state contamination
+    this.clearPhaseTimer(roomCode);
+
+    const redis = this.redisService.getClient();
+    const state = await redis.hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
+    const totalRounds = Number(state.totalRounds ?? 3);
+
+    // Initialize atomic execution engine block
+    const multi = redis.multi();
+
+    // 1. Clear round-specific telemetry keys across historical cycles
+    for (let round = 1; round <= totalRounds; round++) {
+      multi.del(REDIS_KEYS.ROUND_STATE(roomCode, round));
+      multi.del(REDIS_KEYS.ROUND_DRAWINGS(roomCode, round));
+      multi.del(REDIS_KEYS.ROUND_SUBMITTED(roomCode, round));
+      multi.del(REDIS_KEYS.GALLERY_ORDER(roomCode, round));
+      multi.del(REDIS_KEYS.GALLERY_INDEX(roomCode, round));
+    }
+
+    // 2. Erase global match standings, history caches, and prompt indexes
+    multi.del(REDIS_KEYS.LEADERBOARD(roomCode));
+    multi.del(REDIS_KEYS.PROMPT_HISTORY(roomCode));
+    multi.del(REDIS_KEYS.USED_PROMPTS(roomCode));
+
+    // 3. Purge operational transition locks to prevent systemic deadlocks in the next match
+    multi.del(REDIS_KEYS.GAME_START_LOCK(roomCode));
+    multi.del(REDIS_KEYS.ROUND_TRANSITION_LOCK(roomCode));
+    multi.del(`lock:transition:${roomCode}`); // Fallback for dynamic stage transition locks
+
+    // 4. Return room context footprint cleanly back to LOBBY status configurations
+    multi.hmset(REDIS_KEYS.ROOM_STATE(roomCode), {
+      status: RoomStatus.LOBBY,
+      currentRound: '0',
+      roundStartTimestamp: '',
+      roundEndTimestamp: '',
+      activePrompt: '',
+    });
+
+    // Fire safe atomic bundle transaction sequence
+    await multi.exec();
+
+    this.logger.log(
+      JSON.stringify({
+        event: 'service_match_reset_completed',
+        roomCode,
+        executedBy: hostPlayerId,
+        clearedRoundsCount: totalRounds,
+      }),
+    );
   }
 }
