@@ -11,7 +11,7 @@ import { PROMPTS, PromptTheme } from './constants/prompts';
 import { GAME_TIMERS } from './constants/game-timers';
 
 import { randomUUID } from 'crypto';
-import { GalleryEntry } from './interfaces/gallery-entry.interface';
+import { GalleryEntry } from './interfaces/v1-gallery-entry.interface';
 
 const RECONNECT_GRACE_SECONDS = 30;
 
