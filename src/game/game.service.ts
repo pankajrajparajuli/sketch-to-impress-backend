@@ -426,10 +426,23 @@ export class GameService {
       REDIS_KEYS.LEADERBOARD(roomCode),
     );
 
-    const remainingTime = Math.max(
-      0,
-      Math.floor((Number(state.roundEndTimestamp ?? 0) - Date.now()) / 1000),
-    );
+    // --- Sprint 25 Part 2: Timer Logic ---
+    const now = Date.now();
+    let remainingSeconds = 0;
+
+    if (state.status === RoomStatus.DRAWING && state.roundEndTimestamp) {
+      remainingSeconds = Math.max(
+        0,
+        Math.ceil((Number(state.roundEndTimestamp) - now) / 1000),
+      );
+    }
+
+    if (state.status === RoomStatus.GALLERY && state.galleryEndTimestamp) {
+      remainingSeconds = Math.max(
+        0,
+        Math.ceil((Number(state.galleryEndTimestamp) - now) / 1000),
+      );
+    }
 
     const leaderboard: LeaderboardEntry[] = roster.map((p) => ({
       playerId: p.playerId,
@@ -445,10 +458,19 @@ export class GameService {
       totalRounds: Number(state.totalRounds ?? 3),
       timerDuration: Number(state.timerDuration ?? 90),
       theme: (state.theme as PromptTheme) ?? 'RANDOM',
-      remainingTime,
       activePrompt: state.activePrompt ?? null,
       leaderboard,
       players: roster,
+
+      // Required fields for Sprint 25
+      serverTime: now,
+      remainingSeconds,
+      roundEndTimestamp: state.roundEndTimestamp
+        ? Number(state.roundEndTimestamp)
+        : null,
+      galleryEndTimestamp: state.galleryEndTimestamp
+        ? Number(state.galleryEndTimestamp)
+        : null,
     };
   }
 
