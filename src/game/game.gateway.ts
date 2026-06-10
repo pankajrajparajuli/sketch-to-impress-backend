@@ -1003,55 +1003,57 @@ export class GameGateway
       );
 
       if (isHost) {
-        const existingMigrationTimer =
-          this.hostMigrationTimers.get(playerId);
+        const existingMigrationTimer = this.hostMigrationTimers.get(playerId);
         if (existingMigrationTimer) {
           clearTimeout(existingMigrationTimer);
         }
 
-        const migrationTimer = setTimeout(() => {
-          this.hostMigrationTimers.delete(playerId);
+        const migrationTimer = setTimeout(
+          () => {
+            this.hostMigrationTimers.delete(playerId);
 
-          const runMigration = async (): Promise<void> => {
-            const stillDisconnected =
-              !(await this.gameService.canReconnect(playerId));
+            const runMigration = async (): Promise<void> => {
+              const stillDisconnected =
+                !(await this.gameService.canReconnect(playerId));
 
-            if (stillDisconnected) {
-              this.logger.log(
+              if (stillDisconnected) {
+                this.logger.log(
+                  JSON.stringify({
+                    event: 'host_migration_triggered',
+                    roomCode,
+                    message:
+                      'Host failed to reconnect within grace window. Executing migration.',
+                  }),
+                );
+
+                const newHost = await this.gameService.migrateHost(roomCode);
+
+                if (newHost) {
+                  this.server.to(roomCode).emit('v1:room:host_changed', {
+                    roomCode,
+                    hostId: newHost.playerId,
+                    username: newHost.username,
+                  });
+                }
+              }
+            };
+
+            runMigration().catch((err: unknown) => {
+              const message =
+                err instanceof Error
+                  ? err.message
+                  : 'Migration process exception.';
+              this.logger.error(
                 JSON.stringify({
-                  event: 'host_migration_triggered',
+                  event: 'host_migration_error',
                   roomCode,
-                  message:
-                    'Host failed to reconnect within grace window. Executing migration.',
+                  message,
                 }),
               );
-
-              const newHost = await this.gameService.migrateHost(roomCode);
-
-              if (newHost) {
-                this.server.to(roomCode).emit('v1:room:host_changed', {
-                  roomCode,
-                  hostId: newHost.playerId,
-                  username: newHost.username,
-                });
-              }
-            }
-          };
-
-          runMigration().catch((err: unknown) => {
-            const message =
-              err instanceof Error
-                ? err.message
-                : 'Migration process exception.';
-            this.logger.error(
-              JSON.stringify({
-                event: 'host_migration_error',
-                roomCode,
-                message,
-              }),
-            );
-          });
-        }, Number(process.env.HOST_MIGRATION_GRACE_MS ?? 30000));
+            });
+          },
+          Number(process.env.HOST_MIGRATION_GRACE_MS ?? 30000),
+        );
 
         this.hostMigrationTimers.set(playerId, migrationTimer);
       }

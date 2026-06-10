@@ -22,7 +22,9 @@ import {
 const DEFAULT_RECONNECT_GRACE_SECONDS = 30;
 
 function getReconnectGraceSeconds(): number {
-  return Number(process.env.RECONNECT_GRACE_SECONDS ?? DEFAULT_RECONNECT_GRACE_SECONDS);
+  return Number(
+    process.env.RECONNECT_GRACE_SECONDS ?? DEFAULT_RECONNECT_GRACE_SECONDS,
+  );
 }
 
 @Injectable()
@@ -401,9 +403,7 @@ export class GameService {
           username: player.username ?? '',
           isHost,
           connected: player.connected === 'true',
-          ...(isHost
-            ? { hostId: authoritativeHostId || playerId }
-            : {}),
+          ...(isHost ? { hostId: authoritativeHostId || playerId } : {}),
         };
       });
   }
@@ -675,9 +675,7 @@ export class GameService {
       multi.del(REDIS_KEYS.GALLERY_INDEX(roomCode, round));
 
       for (const playerId of playerIds) {
-        multi.del(
-          `sti:v1:room:${roomCode}:round:${round}:player:${playerId}`,
-        );
+        multi.del(`sti:v1:room:${roomCode}:round:${round}:player:${playerId}`);
         multi.del(REDIS_KEYS.SUBMISSION_LOCK(playerId, round));
       }
     }
