@@ -90,6 +90,18 @@ export class GameGateway
           if (status === RoomStatus.GALLERY) {
             const currentRound = Number(roomState.currentRound ?? 1);
             await this.startGalleryCarousel(roomCode, currentRound);
+          } else if (status === RoomStatus.DRAWING) {
+            // Mid-game round advancement for round 2, 3, etc.
+            const currentRound = Number(roomState.currentRound ?? 1);
+            const prompt = await this.gameService.getUniquePrompt(roomCode);
+
+            this.server.to(roomCode).emit('v1:round:started', {
+              roomCode,
+              round: currentRound,
+              prompt,
+              roundEndTimestamp: Number(roomState.roundEndTimestamp),
+              serverTime: Date.now(),
+            });
           }
         })
         .catch((err: unknown) => {
@@ -169,6 +181,14 @@ export class GameGateway
         strokes: safeDrawing.strokes,
       };
 
+      // Calculate and persist carousel step end timestamp
+      const galleryEndTimestamp =
+        Date.now() + GAME_TIMERS.VOTING_SECONDS_PER_CANVAS * 1000;
+
+      await redisClient.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
+        galleryEndTimestamp: String(galleryEndTimestamp),
+      });
+
       this.server.to(roomCode).emit('v1:gallery:next_canvas', {
         roomCode,
         round,
@@ -176,6 +196,8 @@ export class GameGateway
         total,
         drawing: anonymousDrawing,
         votingSeconds: GAME_TIMERS.VOTING_SECONDS_PER_CANVAS,
+        galleryEndTimestamp,
+        serverTime: Date.now(),
       });
 
       // INCREMENT AND IMMEDIATELY UPDATE REDIS
@@ -302,8 +324,6 @@ export class GameGateway
 
     await this.advanceGalleryCanvas(roomCode, currentRound);
   }
-
-  // HANDLERS FOR EXTERNAL DISCONNECTIONS DURING GALLERY PHASE TO RECALCULATE VOTER MAJORITY AND ADVANCE CAROUSEL IF NEEDED
 
   @OnEvent('PLAYER_LEFT')
   async handlePlayerLeftEvent(payload: {
@@ -442,6 +462,7 @@ export class GameGateway
           roomCode,
           currentRound,
           playerId,
+          strokeCount: dto.strokes.length,
         }),
       );
 
@@ -666,19 +687,27 @@ export class GameGateway
 
     const prompt = await this.gameService.getUniquePrompt(roomCode);
 
-    this.server.to(roomCode).emit('v1:round:started', {
-      roomCode,
-      round: 1,
-      prompt,
-    });
-
     const roomState = await this.redis
       .getClient()
       .hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
 
     const duration = Number(roomState.timerDuration ?? 90);
 
+    // Schedule phase transition sets the roundEndTimestamp within the service state layer
     await this.gameService.schedulePhaseTransition(roomCode, duration);
+
+    // Refetch the fresh state containing the set timestamp
+    const updatedRoomState = await redisClient.hgetall(
+      REDIS_KEYS.ROOM_STATE(roomCode),
+    );
+
+    this.server.to(roomCode).emit('v1:round:started', {
+      roomCode,
+      round: 1,
+      prompt,
+      roundEndTimestamp: Number(updatedRoomState.roundEndTimestamp),
+      serverTime: Date.now(),
+    });
   }
 
   @SubscribeMessage('v1:debug:advance_phase')
