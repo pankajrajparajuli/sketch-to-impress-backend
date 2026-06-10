@@ -30,6 +30,8 @@ describe('GameService', () => {
   let mockSmembers: ReturnType<typeof jest.fn>;
   let mockExists: ReturnType<typeof jest.fn>;
   let mockExec: ReturnType<typeof jest.fn>;
+  let mockMulti: ReturnType<typeof jest.fn>;
+  let mockMultiExec: ReturnType<typeof jest.fn>;
 
   // Hook Provider Mock Definitions
   let mockCleanupRoundStrokes: ReturnType<typeof jest.fn>;
@@ -46,9 +48,17 @@ describe('GameService', () => {
     mockSmembers = jest.fn();
     mockExists = jest.fn();
     mockExec = jest.fn();
+    mockMultiExec = jest.fn<() => Promise<unknown[]>>().mockResolvedValue([]);
+    mockMulti = jest.fn().mockReturnValue({
+      del: jest.fn().mockReturnThis(),
+      hmset: jest.fn().mockReturnThis(),
+      exec: mockMultiExec,
+    });
 
-    mockCleanupRoundStrokes = jest.fn();
-    mockCleanupMatch = jest.fn();
+    mockCleanupRoundStrokes = jest
+      .fn<() => Promise<void>>()
+      .mockResolvedValue(undefined);
+    mockCleanupMatch = jest.fn<() => Promise<void>>().mockResolvedValue(undefined);
 
     const mockPipeline = {
       sadd: mockSadd,
@@ -69,6 +79,7 @@ describe('GameService', () => {
         smembers: mockSmembers,
         exists: mockExists,
         pipeline: () => mockPipeline,
+        multi: mockMulti,
       }),
     };
 
@@ -89,6 +100,7 @@ describe('GameService', () => {
   });
 
   afterEach(() => {
+    jest.clearAllTimers();
     jest.restoreAllMocks();
     jest.useRealTimers();
   });
@@ -376,6 +388,10 @@ describe('GameService', () => {
       const result = await service.advancePhase(roomCode);
       expect(result.next).toBe(RoomStatus.ROUND_RESULTS);
       expect(mockCleanupRoundStrokes).toHaveBeenCalledWith(roomCode, 2, ['p1']);
+
+      (service as unknown as { clearPhaseTimer: (code: string) => void }).clearPhaseTimer(
+        roomCode,
+      );
     });
 
     it('should iterate round counts and move to DRAWING if maximum rounds remain unmatched', async () => {
@@ -398,15 +414,22 @@ describe('GameService', () => {
       mockSmembers.mockResolvedValue(['p1']);
       mockExec.mockResolvedValue([[null, { playerId: 'p1' }]]);
 
-      jest.useFakeTimers();
+      const setTimeoutSpy = jest.spyOn(global, 'setTimeout');
+      const callsBefore = setTimeoutSpy.mock.calls.length;
+
       const result = await service.advancePhase(roomCode);
       expect(result.next).toBe(RoomStatus.FINAL_RESULTS);
 
-      jest.advanceTimersByTime(30000);
+      const cleanupCall = setTimeoutSpy.mock.calls
+        .slice(callsBefore)
+        .find((call) => call[1] === 30000);
+      expect(cleanupCall).toBeDefined();
 
-      const wrappedCleanupCheck = () => mockCleanupMatch(roomCode, 3, ['p1']);
-      wrappedCleanupCheck();
+      const cleanupCallback = cleanupCall?.[0] as () => void;
+      cleanupCallback();
+
       expect(mockCleanupMatch).toHaveBeenCalledWith(roomCode, 3, ['p1']);
+      setTimeoutSpy.mockRestore();
     });
   });
 
@@ -628,6 +651,111 @@ describe('GameService', () => {
       expect(scoreStandings[0]?.rank).toBe(1);
       expect(scoreStandings[1]?.playerId).toBe('p1');
       expect(scoreStandings[1]?.rank).toBe(2);
+    });
+  });
+
+  describe('Eligible voter counting', () => {
+    it('should exclude disconnected players and the active artist', async () => {
+      mockSmembers.mockResolvedValue(['p1', 'p2', 'p3']);
+      mockExec.mockResolvedValue([
+        [
+          null,
+          { playerId: 'p1', username: 'A', connected: 'true', isHost: 'true' },
+        ],
+        [
+          null,
+          { playerId: 'p2', username: 'B', connected: 'true', isHost: 'false' },
+        ],
+        [
+          null,
+          {
+            playerId: 'p3',
+            username: 'C',
+            connected: 'false',
+            isHost: 'false',
+          },
+        ],
+      ]);
+
+      const count = await service.countEligibleVoters('ROOM1', 'p1');
+      expect(count).toBe(1);
+    });
+  });
+
+  describe('Match results and reset flows', () => {
+    const roomCode = 'MATCH1';
+
+    it('should build ranked podium payload for match over broadcasts', async () => {
+      mockHgetall.mockResolvedValue({ p1: '10', p2: '25', p3: '15' });
+      mockSmembers.mockResolvedValue(['p1', 'p2', 'p3']);
+      mockExec.mockResolvedValue([
+        [null, { playerId: 'p1', username: 'One' }],
+        [null, { playerId: 'p2', username: 'Two' }],
+        [null, { playerId: 'p3', username: 'Three' }],
+      ]);
+
+      const results = await service.buildMatchResults(roomCode);
+
+      expect(results.standings[0]).toEqual(
+        expect.objectContaining({ playerId: 'p2', rank: 1, score: 25 }),
+      );
+      expect(results.podium).toHaveLength(3);
+      expect(results.podium[0]?.playerId).toBe('p2');
+    });
+
+    it('should reject reset when caller is not the room host', async () => {
+      mockHgetall.mockResolvedValue({ hostId: 'host-1' });
+
+      await expect(service.resetMatch(roomCode, 'not-host')).rejects.toThrow(
+        'Only host may restart match.',
+      );
+    });
+
+    it('should execute atomic multi reset for play again', async () => {
+      mockHgetall
+        .mockResolvedValueOnce({ hostId: 'host-1' })
+        .mockResolvedValueOnce({ totalRounds: '2' });
+      mockSmembers.mockResolvedValue(['p1']);
+      mockExec.mockResolvedValue([[null, { playerId: 'p1' }]]);
+
+      await service.resetMatch(roomCode, 'host-1');
+
+      expect(mockMulti).toHaveBeenCalled();
+      expect(mockMultiExec).toHaveBeenCalled();
+    });
+
+    it('should compute gallery remaining seconds in reconnect snapshots', async () => {
+      const currentTick = 2000000000000;
+      jest.spyOn(Date, 'now').mockReturnValue(currentTick);
+
+      mockHgetall.mockImplementation((key: string) => {
+        if (key === REDIS_KEYS.ROOM_STATE(roomCode)) {
+          return Promise.resolve({
+            status: RoomStatus.GALLERY,
+            currentRound: '1',
+            totalRounds: '1',
+            timerDuration: '60',
+            theme: 'GAMING',
+            galleryEndTimestamp: String(currentTick + 15000),
+          });
+        }
+        if (key === REDIS_KEYS.LEADERBOARD(roomCode)) {
+          return Promise.resolve({});
+        }
+        return Promise.resolve({});
+      });
+
+      mockSmembers.mockResolvedValue(['p1']);
+      mockExec.mockResolvedValue([
+        [
+          null,
+          { playerId: 'p1', username: 'P1', isHost: 'true', connected: 'true' },
+        ],
+      ]);
+
+      const snapshot = await service.buildReconnectSnapshot(roomCode, 'p1');
+      expect(snapshot.remainingSeconds).toBe(15);
+      expect(snapshot.galleryEndTimestamp).toBe(currentTick + 15000);
     });
   });
 });

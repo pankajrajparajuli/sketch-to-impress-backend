@@ -1,6 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
-import request from 'supertest';
+import * as request from 'supertest';
 // ... rest of your imports
 import { io, Socket as ClientSocket } from 'socket.io-client';
 import { AppModule } from '../src/app.module';

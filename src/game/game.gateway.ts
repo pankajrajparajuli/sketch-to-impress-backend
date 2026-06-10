@@ -14,7 +14,7 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
-import { OnEvent } from '@nestjs/event-emitter';
+import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
 import * as jwt from 'jsonwebtoken';
 import { Server, Socket } from 'socket.io';
 
@@ -81,6 +81,7 @@ export class GameGateway
   constructor(
     private readonly redis: RedisService,
     private readonly gameService: GameService,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   afterInit(): void {
@@ -117,7 +118,7 @@ export class GameGateway
               roomState.activePrompt ??
               (await this.gameService.getUniquePrompt(roomCode));
 
-            this.server.to(roomCode).emit('v1:round:started', {
+            this.server.to(roomCode).emit('v1:game:round_started', {
               roomCode,
               round: currentRound,
               prompt,
@@ -296,11 +297,10 @@ export class GameGateway
       return false;
     }
 
-    const roster = await this.gameService.getRoomRoster(roomCode);
-
-    const eligibleVoters = roster.filter(
-      (player) => player.playerId !== drawing.playerId,
-    ).length;
+    const eligibleVoters = await this.gameService.countEligibleVoters(
+      roomCode,
+      drawing.playerId,
+    );
 
     const completedVoters = await redisClient.scard(
       REDIS_KEYS.VOTERS(roomCode, currentRound, drawingId),
@@ -399,17 +399,19 @@ export class GameGateway
     await this.handleGalleryDisconnect(payload.roomCode);
   }
 
-  private async advanceGalleryCanvas(
-    roomCode: string,
-    round: number,
-  ): Promise<void> {
+  private clearGalleryTimer(roomCode: string): void {
     const timer = this.galleryTimers.get(roomCode);
-
     if (timer) {
       clearTimeout(timer);
       this.galleryTimers.delete(roomCode);
     }
+  }
 
+  private async advanceGalleryCanvas(
+    roomCode: string,
+    round: number,
+  ): Promise<void> {
+    this.clearGalleryTimer(roomCode);
     await this.startGalleryCarousel(roomCode, round);
   }
 
@@ -750,7 +752,7 @@ export class GameGateway
       REDIS_KEYS.ROOM_STATE(roomCode),
     );
 
-    this.server.to(roomCode).emit('v1:round:started', {
+    this.server.to(roomCode).emit('v1:game:round_started', {
       roomCode,
       round: 1,
       prompt,
@@ -774,6 +776,7 @@ export class GameGateway
       forbidNonWhitelisted: true,
     }),
   )
+  @UseGuards(GatewayGuard)
   @SubscribeMessage('v1:host:trigger_play_again')
   async triggerPlayAgain(
     @ConnectedSocket() client: AppSocket,
@@ -794,6 +797,8 @@ export class GameGateway
     }
 
     try {
+      this.clearGalleryTimer(roomCode);
+
       // 1. Run multi/exec transaction sequence inside the service layer
       await this.gameService.resetMatch(roomCode, playerId);
 
@@ -968,6 +973,8 @@ export class GameGateway
     try {
       await this.gameService.markPlayerDisconnected(playerId);
       await this.gameService.createReconnectWindow(playerId);
+
+      this.eventEmitter.emit('PLAYER_LEFT', { roomCode, playerId });
 
       this.logger.log(
         JSON.stringify({

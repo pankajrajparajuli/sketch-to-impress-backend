@@ -2,8 +2,6 @@ import 'reflect-metadata';
 import { describe, it, expect } from '@jest/globals';
 import { validate } from 'class-validator';
 import { UpdateSettingsDto } from './update-settings.dto';
-import { validate } from 'class-validator';
-import { UpdateSettingsDto } from './update-settings.dto';
 
 describe('UpdateSettingsDto Validation', () => {
   it('should validate successfully with correct values', async () => {

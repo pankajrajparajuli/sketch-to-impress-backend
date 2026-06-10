@@ -421,6 +421,16 @@ export class GameService {
     return roster.filter((player) => player.connected);
   }
 
+  async countEligibleVoters(
+    roomCode: string,
+    artistPlayerId: string,
+  ): Promise<number> {
+    const roster = await this.getRoomRoster(roomCode);
+    return roster.filter(
+      (player) => player.connected && player.playerId !== artistPlayerId,
+    ).length;
+  }
+
   async cleanupRoom(roomCode: string): Promise<void> {
     const roster = await this.getRoomRoster(roomCode);
     const playerIds = roster.map((p) => p.playerId);
@@ -628,6 +638,8 @@ export class GameService {
     const redis = this.redisService.getClient();
     const state = await redis.hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
     const totalRounds = Number(state.totalRounds ?? 3);
+    const roster = await this.getRoomRoster(roomCode);
+    const playerIds = roster.map((player) => player.playerId);
 
     // Initialize atomic execution engine block
     const multi = redis.multi();
@@ -639,6 +651,13 @@ export class GameService {
       multi.del(REDIS_KEYS.ROUND_SUBMITTED(roomCode, round));
       multi.del(REDIS_KEYS.GALLERY_ORDER(roomCode, round));
       multi.del(REDIS_KEYS.GALLERY_INDEX(roomCode, round));
+
+      for (const playerId of playerIds) {
+        multi.del(
+          `sti:v1:room:${roomCode}:round:${round}:player:${playerId}`,
+        );
+        multi.del(REDIS_KEYS.SUBMISSION_LOCK(playerId, round));
+      }
     }
 
     // 2. Erase global match standings, history caches, and prompt indexes
@@ -658,6 +677,8 @@ export class GameService {
       roundStartTimestamp: '',
       roundEndTimestamp: '',
       activePrompt: '',
+      activeDrawingId: '',
+      galleryEndTimestamp: '',
     });
 
     // Fire safe atomic bundle transaction sequence
