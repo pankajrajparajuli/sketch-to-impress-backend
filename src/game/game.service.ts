@@ -146,10 +146,7 @@ export class GameService {
       }
 
       case RoomStatus.ROUND_RESULTS:
-        await this.schedulePhaseTransition(
-          roomCode,
-          GAME_TIMERS.ROUND_RESULTS_SECONDS,
-        );
+        // Handled internally during the programmatic phase mutation step inside advancePhase()
         break;
 
       case RoomStatus.DRAWING: {
@@ -283,6 +280,16 @@ export class GameService {
     }
 
     await this.updateRoomStatus(roomCode, next);
+
+    // 🚀 SPRINT 26 FIX: Automatically schedule the 10-second timer when we enter ROUND_RESULTS.
+    // This ensures that the game engine ticks over automatically even if advanced programmatically
+    // via a clean gateway method execution loop.
+    if (next === RoomStatus.ROUND_RESULTS) {
+      await this.schedulePhaseTransition(
+        roomCode,
+        GAME_TIMERS.ROUND_RESULTS_SECONDS,
+      );
+    }
 
     this.phaseChangeCallback?.(roomCode, next);
 
@@ -427,7 +434,6 @@ export class GameService {
       REDIS_KEYS.LEADERBOARD(roomCode),
     );
 
-    // --- Sprint 25 Part 2: Timer Logic ---
     const now = Date.now();
     let remainingSeconds = 0;
 
@@ -442,6 +448,14 @@ export class GameService {
       remainingSeconds = Math.max(
         0,
         Math.ceil((Number(state.galleryEndTimestamp) - now) / 1000),
+      );
+    }
+
+    // 🚀 SPRINT 26 FIX: Make sure remaining seconds is accurately compiled for ROUND_RESULTS phase drops
+    if (state.status === RoomStatus.ROUND_RESULTS && state.roundEndTimestamp) {
+      remainingSeconds = Math.max(
+        0,
+        Math.ceil((Number(state.roundEndTimestamp) - now) / 1000),
       );
     }
 
@@ -463,7 +477,6 @@ export class GameService {
       leaderboard,
       players: roster,
 
-      // Required fields for Sprint 25
       serverTime: now,
       remainingSeconds,
       roundEndTimestamp: state.roundEndTimestamp
@@ -501,7 +514,6 @@ export class GameService {
       } as unknown as GalleryEntry);
     }
 
-    // ─── CRITICAL FIX: EXPLICIT FISHER-YATES ARRAY SHUFFLER FOR SPRINT 22 ───
     for (let i = gallery.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       const temp = gallery[i];
@@ -514,7 +526,6 @@ export class GameService {
     return gallery;
   }
 
-  // Helpful utility for compiling round standings in both ROUND_RESULTS and FINAL_RESULTS phases
   async buildRoundStandings(roomCode: string): Promise<RoundResultEntry[]> {
     const redis = this.redisService.getClient();
 

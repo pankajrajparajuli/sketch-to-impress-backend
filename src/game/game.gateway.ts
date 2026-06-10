@@ -82,24 +82,49 @@ export class GameGateway
         .getClient()
         .hgetall(REDIS_KEYS.ROOM_STATE(roomCode))
         .then(async (roomState) => {
+          // 1. BROADCAST STATE CHANGE TO ALL CLIENTS
           this.server.to(roomCode).emit('v1:game:phase_changed', {
             roomCode,
             status,
           });
 
+          // 2. ORCHESTRATE PHASE SPECIFIC BROADCASTS
           if (status === RoomStatus.GALLERY) {
             const currentRound = Number(roomState.currentRound ?? 1);
             await this.startGalleryCarousel(roomCode, currentRound);
+          } else if (status === RoomStatus.ROUND_RESULTS) {
+            // 🚀 SPRINT 26 CORRECTION: Handle scoreboard view payload setup
+            const currentRound = Number(roomState.currentRound ?? 1);
+            const standings =
+              await this.gameService.buildRoundStandings(roomCode);
+
+            this.server.to(roomCode).emit('v1:game:round_results_started', {
+              roomCode,
+              round: currentRound,
+              standings,
+              endsAt: Date.now() + GAME_TIMERS.ROUND_RESULTS_SECONDS * 1000,
+              serverTime: Date.now(),
+            });
           } else if (status === RoomStatus.DRAWING) {
             // Mid-game round advancement for round 2, 3, etc.
             const currentRound = Number(roomState.currentRound ?? 1);
-            const prompt = await this.gameService.getUniquePrompt(roomCode);
+            const prompt =
+              roomState.activePrompt ??
+              (await this.gameService.getUniquePrompt(roomCode));
 
             this.server.to(roomCode).emit('v1:round:started', {
               roomCode,
               round: currentRound,
               prompt,
               roundEndTimestamp: Number(roomState.roundEndTimestamp),
+              serverTime: Date.now(),
+            });
+          } else if (status === RoomStatus.FINAL_RESULTS) {
+            const standings =
+              await this.gameService.buildRoundStandings(roomCode);
+            this.server.to(roomCode).emit('v1:game:final_results_started', {
+              roomCode,
+              standings,
               serverTime: Date.now(),
             });
           }
@@ -134,6 +159,7 @@ export class GameGateway
     if (gallery.length === 0) {
       const standings = await this.gameService.buildRoundStandings(roomCode);
 
+      // Emitting the completion events before triggering state engine advancement mutations
       this.server.to(roomCode).emit('v1:game:round_complete', {
         roomCode,
         round,
@@ -144,19 +170,26 @@ export class GameGateway
       return;
     }
 
-    // LOAD PREVIOUS STATE FROM REDIS INSTANCE INSTEAD OF INITIALIZING TO 0
     let index = await this.gameService.getGalleryIndex(roomCode, round);
     const redisClient = this.redis.getClient();
 
     const runCarouselStep = async () => {
+      // 🚀 FIX: Catch natural layout progression indexing out-of-bounds bounds cleanly
       if (index >= gallery.length) {
         this.galleryTimers.delete(roomCode);
         await redisClient.hdel(
           REDIS_KEYS.ROOM_STATE(roomCode),
           'activeDrawingId',
         );
-        // CLEAN UP THE GALLERY INDEX ON COMPLETED CAROUSEL LOOP
         await this.gameService.deleteGalleryIndex(roomCode, round);
+
+        const standings = await this.gameService.buildRoundStandings(roomCode);
+        this.server.to(roomCode).emit('v1:game:round_complete', {
+          roomCode,
+          round,
+          standings,
+        });
+
         await this.gameService.advancePhase(roomCode);
         return;
       }
@@ -170,6 +203,7 @@ export class GameGateway
           'activeDrawingId',
         );
         await this.gameService.deleteGalleryIndex(roomCode, round);
+
         const standings = await this.gameService.buildRoundStandings(roomCode);
         this.server.to(roomCode).emit('v1:game:round_complete', {
           roomCode,
@@ -196,7 +230,6 @@ export class GameGateway
         strokes: safeDrawing.strokes,
       };
 
-      // Calculate and persist carousel step end timestamp
       const galleryEndTimestamp =
         Date.now() + GAME_TIMERS.VOTING_SECONDS_PER_CANVAS * 1000;
 
@@ -215,7 +248,6 @@ export class GameGateway
         serverTime: Date.now(),
       });
 
-      // INCREMENT AND IMMEDIATELY UPDATE REDIS
       index++;
       await this.gameService.setGalleryIndex(roomCode, round, index);
 
@@ -231,8 +263,6 @@ export class GameGateway
 
     await runCarouselStep();
   }
-
-  // HANDLERS FOR EXTERNAL DISCONNECTIONS DURING GALLERY PHASE TO RECALCULATE VOTER MAJORITY AND ADVANCE CAROUSEL IF NEEDED
 
   private async checkGalleryCompletion(
     roomCode: string,
@@ -254,7 +284,6 @@ export class GameGateway
 
     const roster = await this.gameService.getRoomRoster(roomCode);
 
-    // Filter out the artist from the baseline calculation
     const eligibleVoters = roster.filter(
       (player) => player.playerId !== drawing.playerId,
     ).length;
@@ -306,7 +335,6 @@ export class GameGateway
       return;
     }
 
-    // Race Condition Protection: Check atomic mutation lock
     const lockKey = REDIS_KEYS.GALLERY_ADVANCE_LOCK(
       roomCode,
       currentRound,
@@ -370,8 +398,6 @@ export class GameGateway
 
     await this.startGalleryCarousel(roomCode, round);
   }
-
-  // ── WebSocket Ingestion Pipeline Event Listeners ─────────────────────────────
 
   @UsePipes(
     new ValidationPipe({
@@ -556,7 +582,6 @@ export class GameGateway
       return { success: false };
     }
 
-    // 1. VALIDATION BARRIER: Block out self-voters before any state mutation
     if (targetItem.playerId === playerId) {
       this.logger.warn(
         JSON.stringify({
@@ -570,7 +595,6 @@ export class GameGateway
       return { success: false };
     }
 
-    // 2. STATE MUTATION: Try adding voter to set safely
     const added = await redisClient.sadd(votersKey, playerId);
 
     if (added === 0) {
@@ -586,7 +610,6 @@ export class GameGateway
       return { success: false };
     }
 
-    // 3. PERSIST SCORES AND LOG REWARDS
     if (targetItem && targetItem.playerId) {
       const leaderboardKey = REDIS_KEYS.LEADERBOARD(roomCode);
       await redisClient.hincrby(leaderboardKey, targetItem.playerId, dto.stars);
@@ -603,7 +626,6 @@ export class GameGateway
       }),
     );
 
-    // ─── EARLY ADVANCE CHECKS ───────────────────────────────
     const complete = await this.checkGalleryCompletion(
       roomCode,
       currentRound,
@@ -708,10 +730,8 @@ export class GameGateway
 
     const duration = Number(roomState.timerDuration ?? 90);
 
-    // Schedule phase transition sets the roundEndTimestamp within the service state layer
     await this.gameService.schedulePhaseTransition(roomCode, duration);
 
-    // Refetch the fresh state containing the set timestamp
     const updatedRoomState = await redisClient.hgetall(
       REDIS_KEYS.ROOM_STATE(roomCode),
     );
