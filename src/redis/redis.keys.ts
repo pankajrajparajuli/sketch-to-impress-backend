@@ -97,8 +97,9 @@ export const REDIS_KEYS = {
   // ── Gallery Voting Keys ──────────────────────────────────────────────────────
 
   /** Per-drawing voter set — tracks which playerIds have cast a star rating */
-  VOTERS: (roomCode: string, roundNumber: number, drawingId: string): string =>
-    `sti:v1:room:${roomCode}:round:${roundNumber}:drawing:${drawingId}:voters`,
+  VOTERS(roomCode: string, round: number, drawingId: string): string {
+    return `sti:v1:room:${roomCode}:round:${round}:drawing:${drawingId}:voters`;
+  },
 
   // ── Prompt History Keys ──────────────────────────────────────────────────────
 

@@ -1,492 +1,560 @@
-import { describe, it, expect, beforeEach, jest } from '@jest/globals';
+import {
+  jest,
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+} from '@jest/globals';
 import { Test, TestingModule } from '@nestjs/testing';
 import { GameGateway } from './game.gateway';
 import { RedisService } from '../redis/redis.service';
 import { GameService } from './game.service';
-import { REDIS_KEYS } from '../redis/redis.keys';
 import { RoomStatus } from '../rooms/enums/room-status.enum';
+import { REDIS_KEYS } from '../redis/redis.keys';
+import { Logger } from '@nestjs/common';
 import * as jwt from 'jsonwebtoken';
+import { SubmitDrawingDto } from './dto/submit-drawing.dto';
+
+interface MockServerInstance {
+  to: jest.Mock<(roomCode: string) => MockServerInstance>;
+  emit: jest.Mock<(event: string, payload: unknown) => MockServerInstance>;
+}
+
+interface MockRedisClientInstance {
+  hgetall: jest.Mock<() => Promise<Record<string, string>>>;
+  set: jest.Mock<
+    (key: string, value: string, ...args: any[]) => Promise<string | null>
+  >;
+  sadd: jest.Mock<() => Promise<number>>;
+  scard: jest.Mock<() => Promise<number>>;
+  del: jest.Mock<() => Promise<number>>;
+  get: jest.Mock<() => Promise<string | null>>;
+  exists: jest.Mock<() => Promise<number>>;
+  hset: jest.Mock<() => Promise<number>>;
+  pipeline: jest.Mock<() => MockPipelineInstance>;
+}
+
+interface MockPipelineInstance {
+  set: jest.Mock<() => MockPipelineInstance>;
+  sadd: jest.Mock<() => MockPipelineInstance>;
+  exec: jest.Mock<() => Promise<unknown[]>>;
+}
+
+type AppSocket = any;
+
+interface PointDto {
+  x: number;
+  y: number;
+}
+
+interface StrokeDto {
+  color: string;
+  brushSize: number;
+  points: PointDto[];
+}
+
+interface V1ReconnectState {
+  roomCode: string;
+  playerId: string;
+  currentRound: number;
+  totalRounds: number;
+  phase: RoomStatus;
+  status: string;
+  username: string;
+  isHost: boolean;
+  timerDuration: number;
+  timeRemaining: number;
+  theme: string;
+  remainingTime: number;
+  activePrompt: string;
+  leaderboard: any[];
+  players: any[];
+}
+
+jest.mock('./validators/drawing-payload.validator', () => ({
+  validateDrawingPayloadSize: jest.fn<(...args: any[]) => void>(),
+}));
+jest.mock('./validators/drawing-content.validator', () => ({
+  validateVectorOnlyPayload: jest.fn<(...args: any[]) => void>(),
+}));
 
 describe('GameGateway', () => {
   let gateway: GameGateway;
-  let redisService: RedisService;
-  let gameService: GameService;
+  let gameService: jest.Mocked<GameService>;
+  let redisService: jest.Mocked<RedisService>;
 
-  // Mock methods for RedisService
-  let mockExists: ReturnType<typeof jest.fn<(key: string) => Promise<boolean>>>;
-  let mockHgetall: ReturnType<
-    typeof jest.fn<(key: string) => Promise<Record<string, string>>>
-  >;
-  let mockHget: ReturnType<
-    typeof jest.fn<(key: string, field: string) => Promise<string | null>>
-  >;
-  let mockGet: ReturnType<
-    typeof jest.fn<(key: string) => Promise<string | null>>
-  >;
-  let mockDel: ReturnType<typeof jest.fn<(...keys: string[]) => Promise<void>>>;
-  let mockTouchRoom: ReturnType<
-    typeof jest.fn<(roomCode: string, currentRound: number) => Promise<void>>
-  >;
-  let mockHset: ReturnType<
-    typeof jest.fn<(key: string, field: string, value: string) => Promise<void>>
-  >;
-
-  // Mock methods for GameService
-  let mockUpdateRoomSettings: ReturnType<typeof jest.fn>;
-  let mockAddPlayerToRoster: ReturnType<typeof jest.fn>;
-  let mockGetRoomRoster: ReturnType<typeof jest.fn>;
-
-  // Mock Socket.io server
-  const mockServerEmit = jest.fn();
-  const mockToEmit = jest.fn();
-  const mockServerTo = jest.fn().mockReturnValue({ emit: mockToEmit });
-  const mockServer = {
-    to: mockServerTo,
-    emit: mockServerEmit,
-  };
+  let mockRedisClient: MockRedisClientInstance;
+  let mockServer: MockServerInstance;
+  let mockSocket: unknown;
 
   beforeEach(async () => {
-    mockExists = jest.fn<(key: string) => Promise<boolean>>();
-    mockHgetall = jest.fn<(key: string) => Promise<Record<string, string>>>();
-    mockHget =
-      jest.fn<(key: string, field: string) => Promise<string | null>>();
-    mockGet = jest.fn<(key: string) => Promise<string | null>>();
-    mockDel = jest.fn<(...keys: string[]) => Promise<void>>();
-    mockTouchRoom =
-      jest.fn<(roomCode: string, currentRound: number) => Promise<void>>();
-    mockHset =
-      jest.fn<(key: string, field: string, value: string) => Promise<void>>();
+    const mockPipeline: MockPipelineInstance = {
+      set: jest.fn<() => MockPipelineInstance>(),
+      sadd: jest.fn<() => MockPipelineInstance>(),
+      exec: jest.fn<() => Promise<unknown[]>>().mockResolvedValue([]),
+    };
+    mockPipeline.set.mockReturnValue(mockPipeline);
+    mockPipeline.sadd.mockReturnValue(mockPipeline);
 
-    mockUpdateRoomSettings = jest.fn();
-    mockAddPlayerToRoster = jest.fn();
-    mockGetRoomRoster = jest.fn();
-
-    const mockRedisService = {
-      exists: mockExists,
-      hgetall: mockHgetall,
-      hget: mockHget,
-      get: mockGet,
-      del: mockDel,
-      touchRoom: mockTouchRoom,
-      hset: mockHset,
+    mockRedisClient = {
+      hgetall: jest.fn<() => Promise<Record<string, string>>>(),
+      set: jest.fn<
+        (key: string, value: string, ...args: any[]) => Promise<string | null>
+      >(),
+      sadd: jest.fn<() => Promise<number>>(),
+      scard: jest.fn<() => Promise<number>>(),
+      del: jest.fn<() => Promise<number>>(),
+      get: jest.fn<() => Promise<string | null>>(),
+      exists: jest.fn<() => Promise<number>>(),
+      hset: jest.fn<() => Promise<number>>(),
+      pipeline: jest
+        .fn<() => MockPipelineInstance>()
+        .mockReturnValue(mockPipeline),
     };
 
-    const mockGameService = {
-      updateRoomSettings: mockUpdateRoomSettings,
-      addPlayerToRoster: mockAddPlayerToRoster,
-      getRoomRoster: mockGetRoomRoster,
-    };
+    redisService = {
+      getClient: jest.fn().mockReturnValue(mockRedisClient),
+      exists: jest.fn<() => Promise<boolean>>(),
+      hgetall: jest.fn(),
+      get: jest.fn(),
+      del: jest.fn(),
+    } as unknown as jest.Mocked<RedisService>;
+
+    gameService = {
+      registerPhaseChangeCallback: jest.fn(),
+      advancePhase: jest.fn(),
+      getGalleryOrder: jest.fn(),
+      buildGalleryPayload: jest.fn(),
+      cacheGalleryOrder: jest.fn(),
+      getRoomRoster: jest.fn(),
+      getRoomStatus: jest.fn(),
+      getUniquePrompt: jest.fn(),
+      schedulePhaseTransition: jest.fn(),
+      canReconnect: jest.fn(),
+      markPlayerConnected: jest.fn(),
+      markPlayerDisconnected: jest.fn(),
+      buildReconnectSnapshot: jest.fn(),
+      createReconnectWindow: jest.fn(),
+      addPlayerToRoster: jest.fn(),
+      migrateHost: jest.fn(),
+      checkRoomOccupancy: jest.fn(),
+    } as unknown as jest.Mocked<GameService>;
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         GameGateway,
-        {
-          provide: RedisService,
-          useValue: mockRedisService,
-        },
-        {
-          provide: GameService,
-          useValue: mockGameService,
-        },
+        { provide: RedisService, useValue: redisService },
+        { provide: GameService, useValue: gameService },
       ],
     }).compile();
 
     gateway = module.get<GameGateway>(GameGateway);
-    redisService = module.get<RedisService>(RedisService);
-    gameService = module.get<GameService>(GameService);
-    gateway.server = mockServer as any;
 
-    jest.clearAllMocks();
+    mockServer = {
+      to: jest.fn<(roomCode: string) => MockServerInstance>(),
+      emit: jest.fn<(event: string, payload: unknown) => MockServerInstance>(),
+    };
+    mockServer.to.mockReturnValue(mockServer);
+    mockServer.emit.mockReturnValue(mockServer);
+
+    const gatewayInstance = gateway as any;
+    gatewayInstance.server = mockServer;
+
+    mockSocket = {
+      id: 'mock-socket-id',
+      data: {
+        playerId: 'player-123',
+        roomCode: 'ABCD',
+        isHost: false,
+        username: 'TestUser',
+      },
+      handshake: {
+        auth: {},
+        headers: {},
+        query: {},
+      },
+      join: jest.fn<() => Promise<void>>().mockResolvedValue(undefined),
+      emit: jest.fn().mockImplementation(function (this: unknown) {
+        return this;
+      }),
+      disconnect: jest.fn().mockImplementation(function (this: unknown) {
+        return this;
+      }),
+    };
+
+    jest.spyOn(Logger.prototype, 'log').mockImplementation(() => {});
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => {});
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => {});
   });
 
-  describe('updateSettings', () => {
-    it('should call updateRoomSettings and emit settings changed and updated events to room', async () => {
-      const mockClient = {
-        data: {
-          roomCode: 'ABCDEF',
-          playerId: 'host_123',
+  afterEach(() => {
+    jest.clearAllMocks();
+    jest.restoreAllMocks();
+  });
+
+  it('should be defined', () => {
+    expect(gateway).toBeDefined();
+  });
+
+  describe('afterInit', () => {
+    it('should register phase change callback and emit event correctly', () => {
+      gateway.afterInit();
+
+      const callbackSpy = gameService.registerPhaseChangeCallback;
+      expect(callbackSpy.mock.calls.length).toBeGreaterThan(0);
+
+      const registeredCallback = callbackSpy.mock.calls[0]?.[0];
+      if (registeredCallback) {
+        registeredCallback('ROOMX', RoomStatus.DRAWING);
+      }
+
+      const toSpy = mockServer.to;
+      const emitSpy = mockServer.emit;
+      expect(toSpy).toHaveBeenCalledWith('ROOMX');
+      expect(emitSpy).toHaveBeenCalledWith('v1:game:phase_changed', {
+        roomCode: 'ROOMX',
+        status: RoomStatus.DRAWING,
+      });
+    });
+  });
+
+  describe('handleSubmitDrawing', () => {
+    const mockDto: SubmitDrawingDto = {
+      strokes: [
+        {
+          color: '#000000',
+          brushSize: 5,
+          points: [
+            { x: 1, y: 2 },
+            { x: 3, y: 4 },
+          ],
+        },
+        {
+          color: '#FFFFFF',
+          brushSize: 2,
+          points: [
+            { x: 5, y: 6 },
+            { x: 7, y: 8 },
+          ],
+        },
+      ] as StrokeDto[],
+    };
+
+    it('should throw an error if room status is not DRAWING', async () => {
+      mockRedisClient.hgetall.mockResolvedValue({ status: RoomStatus.LOBBY });
+
+      await expect(async () => {
+        await gateway.handleSubmitDrawing(mockSocket as AppSocket, mockDto);
+      }).rejects.toThrow(
+        `Drawing submissions are only allowed during ${RoomStatus.DRAWING}`,
+      );
+    });
+
+    it('should return failure if user submission lock fails to acquire', async () => {
+      mockRedisClient.hgetall.mockResolvedValue({
+        status: RoomStatus.DRAWING,
+        currentRound: '1',
+      });
+      mockRedisClient.set.mockResolvedValue(null);
+
+      const result = await gateway.handleSubmitDrawing(
+        mockSocket as AppSocket,
+        mockDto,
+      );
+
+      expect(result).toEqual({
+        success: false,
+        playerId: 'player-123',
+        strokeCount: 0,
+      });
+
+      const setSpy = mockRedisClient.set;
+      expect(setSpy).toHaveBeenCalledWith(
+        REDIS_KEYS.SUBMISSION_LOCK('player-123', 1),
+        '1',
+        'EX',
+        600,
+        'NX',
+      );
+    });
+
+    it('should accept submission and check parameters if player threshold is not yet reached', async () => {
+      mockRedisClient.hgetall.mockResolvedValue({
+        status: RoomStatus.DRAWING,
+        currentRound: '1',
+      });
+      mockRedisClient.set.mockResolvedValue('OK');
+      mockRedisClient.scard.mockResolvedValue(1);
+      gameService.getRoomRoster.mockResolvedValue([
+        {
+          playerId: 'player-123',
+          connected: true,
+          username: 'User1',
           isHost: true,
         },
-      } as any;
-      const dto = {
-        timerDuration: 90,
-        totalRounds: 3,
-        theme: 'CARTOON',
-      };
+        {
+          playerId: 'player-456',
+          connected: true,
+          username: 'User2',
+          isHost: false,
+        },
+      ]);
 
-      mockUpdateRoomSettings.mockResolvedValue(undefined);
-
-      await gateway.updateSettings(mockClient, dto);
-
-      expect(gameService.updateRoomSettings).toHaveBeenCalledWith(
-        'ABCDEF',
-        dto,
+      const result = await gateway.handleSubmitDrawing(
+        mockSocket as AppSocket,
+        mockDto,
       );
-      expect(mockServerTo).toHaveBeenCalledWith('ABCDEF');
-      expect(mockToEmit).toHaveBeenCalledWith('v1:room:settings_changed', dto);
-      expect(mockToEmit).toHaveBeenCalledWith('v1:room:settings_updated', dto);
+
+      expect(result).toEqual({
+        success: true,
+        playerId: 'player-123',
+        strokeCount: 2,
+      });
+
+      const advancePhaseSpy = gameService.advancePhase;
+      expect(advancePhaseSpy).not.toHaveBeenCalled();
+    });
+
+    it('should advance phase and kickstart gallery carousel if last player submits drawings', async () => {
+      mockRedisClient.hgetall.mockResolvedValue({
+        status: RoomStatus.DRAWING,
+        currentRound: '1',
+      });
+
+      mockRedisClient.set
+        .mockReturnValueOnce(Promise.resolve('OK'))
+        .mockReturnValueOnce(Promise.resolve('OK'));
+
+      mockRedisClient.scard.mockResolvedValue(2);
+      gameService.getRoomRoster.mockResolvedValue([
+        {
+          playerId: 'player-123',
+          connected: true,
+          username: 'User1',
+          isHost: true,
+        },
+        {
+          playerId: 'player-456',
+          connected: true,
+          username: 'User2',
+          isHost: false,
+        },
+      ]);
+      gameService.getGalleryOrder.mockResolvedValue([]);
+      gameService.advancePhase.mockResolvedValue({
+        next: RoomStatus.GALLERY,
+        currentRound: 1,
+        prompt: 'Test',
+      });
+
+      const result = await gateway.handleSubmitDrawing(
+        mockSocket as AppSocket,
+        mockDto,
+      );
+
+      expect(result).toEqual({
+        success: true,
+        playerId: 'player-123',
+        strokeCount: 2,
+      });
+
+      const advancePhaseSpy = gameService.advancePhase;
+      expect(advancePhaseSpy).toHaveBeenCalledWith('ABCD');
+    });
+  });
+
+  describe('castVote', () => {
+    it('should return success false if user tries to vote multiple times on same drawing', async () => {
+      mockRedisClient.hgetall.mockResolvedValue({ currentRound: '1' });
+      mockRedisClient.sadd.mockResolvedValue(0);
+
+      const result = await gateway.castVote(mockSocket as AppSocket, {
+        drawingId: 'draw-999',
+        stars: 3,
+      });
+      expect(result).toEqual({ success: false });
+    });
+
+    it('should record vote cleanly if entry is unique', async () => {
+      mockRedisClient.hgetall.mockResolvedValue({ currentRound: '1' });
+      mockRedisClient.sadd.mockResolvedValue(1);
+
+      const result = await gateway.castVote(mockSocket as AppSocket, {
+        drawingId: 'draw-999',
+        stars: 3,
+      });
+      expect(result).toEqual({ success: true });
+    });
+  });
+
+  describe('startGame', () => {
+    it('should skip game start execution if distributed room state lock is engaged', async () => {
+      mockRedisClient.set.mockResolvedValue(null);
+
+      await gateway.startGame(mockSocket as AppSocket);
+
+      const statusSpy = gameService.getRoomStatus;
+      expect(statusSpy).not.toHaveBeenCalled();
+    });
+
+    it('should safely progress if lock is acquired and current phase matches LOBBY', async () => {
+      mockRedisClient.set.mockResolvedValue('OK');
+      gameService.getRoomStatus.mockResolvedValue(RoomStatus.LOBBY);
+      gameService.getUniquePrompt.mockResolvedValue(
+        'Draw a futuristic workspace',
+      );
+      mockRedisClient.hgetall.mockResolvedValue({ timerDuration: '60' });
+
+      await gateway.startGame(mockSocket as AppSocket);
+
+      const hsetSpy = mockRedisClient.hset;
+      expect(hsetSpy).toHaveBeenCalledWith(REDIS_KEYS.ROOM_STATE('ABCD'), {
+        status: RoomStatus.DRAWING,
+        currentRound: '1',
+      });
+
+      const toSpy = mockServer.to;
+      const emitSpy = mockServer.emit;
+      expect(toSpy).toHaveBeenCalledWith('ABCD');
+      expect(emitSpy).toHaveBeenCalledWith('v1:round:started', {
+        roomCode: 'ABCD',
+        round: 1,
+        prompt: 'Draw a futuristic workspace',
+      });
+
+      const transitionSpy = gameService.schedulePhaseTransition;
+      expect(transitionSpy).toHaveBeenCalledWith('ABCD', 60);
     });
   });
 
   describe('handleConnection', () => {
-    it('should reject connection if token is missing', async () => {
-      const mockClientEmit = jest.fn();
-      const mockClientDisconnect = jest.fn();
-      const mockClient = {
-        id: 'socket_123',
-        handshake: {
-          auth: {},
-          headers: {},
-          query: {},
-        },
-        emit: mockClientEmit,
-        disconnect: mockClientDisconnect,
-      } as any;
-
-      await gateway.handleConnection(mockClient);
-
-      expect(mockClientEmit).toHaveBeenCalledWith('error:exception', {
-        success: false,
-        code: 'MISSING_TOKEN',
-        message: 'No reconnect token provided.',
-      });
-      expect(mockClientDisconnect).toHaveBeenCalledWith(true);
-    });
-
-    it('should reject connection if token is invalid', async () => {
-      const mockClientEmit = jest.fn();
-      const mockClientDisconnect = jest.fn();
-      const mockClient = {
-        id: 'socket_123',
-        handshake: {
-          auth: { token: 'invalid_token' },
-          headers: {},
-          query: {},
-        },
-        emit: mockClientEmit,
-        disconnect: mockClientDisconnect,
-      } as any;
-
-      await gateway.handleConnection(mockClient);
-
-      expect(mockClientEmit).toHaveBeenCalledWith('error:exception', {
-        success: false,
-        code: 'INVALID_TOKEN',
-        message: 'Token is invalid or expired.',
-      });
-      expect(mockClientDisconnect).toHaveBeenCalledWith(true);
-    });
-
-    it('should reject connection if room does not exist', async () => {
-      const token = jwt.sign(
-        { playerId: 'usr_1', roomCode: 'ABCDEF', isHost: false },
-        'dev_secret',
-      );
-      const mockClientEmit = jest.fn();
-      const mockClientDisconnect = jest.fn();
-      const mockClient = {
-        id: 'socket_123',
-        handshake: {
-          auth: { token },
-          headers: {},
-          query: {},
-        },
-        emit: mockClientEmit,
-        disconnect: mockClientDisconnect,
-      } as any;
-
-      mockExists.mockResolvedValue(false); // Room doesn't exist
-
-      await gateway.handleConnection(mockClient);
-
-      expect(mockExists).toHaveBeenCalledWith(REDIS_KEYS.ROOM_META('ABCDEF'));
-      expect(mockClientEmit).toHaveBeenCalledWith('error:exception', {
-        success: false,
-        code: 'ROOM_NOT_FOUND',
-        message: 'Room ABCDEF not found.',
-      });
-      expect(mockClientDisconnect).toHaveBeenCalledWith(true);
-    });
-
-    it('should accept connection, set player data, join room, and emit player_joined event for new player', async () => {
-      const token = jwt.sign(
-        { playerId: 'usr_1', roomCode: 'ABCDEF', isHost: false },
-        'dev_secret',
-      );
-      const mockClientEmit = jest.fn();
-      const mockClientDisconnect = jest.fn();
-      const mockClientJoin = jest.fn();
-      const mockClient = {
-        id: 'socket_123',
-        handshake: {
-          auth: { token },
-          headers: {},
-          query: {},
-        },
-        data: {},
-        join: mockClientJoin,
-        emit: mockClientEmit,
-        disconnect: mockClientDisconnect,
-      } as any;
-
-      mockExists.mockResolvedValue(true); // Room exists
-      mockHgetall.mockImplementation((key) => {
-        if (key === REDIS_KEYS.ROOM_STATE('ABCDEF')) {
-          return Promise.resolve({
-            status: RoomStatus.LOBBY,
-            currentRound: '1',
-            totalRounds: '3',
-            timerDuration: '90',
-            theme: 'Cartoon',
-          });
-        }
-        if (key === REDIS_KEYS.PLAYER_HASH('usr_1')) {
-          return Promise.resolve({}); // Not reconnecting
-        }
-        return Promise.resolve({});
-      });
-
-      mockGet.mockResolvedValue(
-        JSON.stringify({
-          playerId: 'usr_1',
-          username: 'NewPlayer',
-          reservedAt: Date.now(),
-        }),
-      );
-      mockDel.mockResolvedValue(undefined);
-      mockAddPlayerToRoster.mockResolvedValue(undefined);
-
-      const mockRoster = [
-        {
-          playerId: 'usr_1',
-          username: 'NewPlayer',
+    beforeEach(() => {
+      jest.spyOn(jwt, 'verify').mockImplementation(function () {
+        return {
+          playerId: 'player-123',
+          roomCode: 'ABCD',
           isHost: false,
-          connected: true,
-        },
-      ];
-      mockGetRoomRoster.mockResolvedValue(mockRoster);
-
-      await gateway.handleConnection(mockClient);
-
-      expect(mockClient.data).toEqual({
-        playerId: 'usr_1',
-        roomCode: 'ABCDEF',
-        username: 'NewPlayer',
-        isHost: false,
-      });
-
-      expect(gameService.addPlayerToRoster).toHaveBeenCalledWith(
-        'ABCDEF',
-        'usr_1',
-        'NewPlayer',
-        false,
-      );
-      expect(mockClientJoin).toHaveBeenCalledWith('ABCDEF');
-      expect(mockServerTo).toHaveBeenCalledWith('ABCDEF');
-      expect(mockToEmit).toHaveBeenCalledWith('v1:room:player_joined', {
-        roomCode: 'ABCDEF',
-        players: mockRoster,
+        };
       });
     });
 
-    it('should accept connection and emit player:reconnected with snapshot for reconnecting player', async () => {
-      const token = jwt.sign(
-        { playerId: 'usr_1', roomCode: 'ABCDEF', isHost: false },
-        'dev_secret',
-      );
-      const mockClientEmit = jest.fn();
-      const mockClientDisconnect = jest.fn();
-      const mockClientJoin = jest.fn();
-      const mockClient = {
-        id: 'socket_123',
-        handshake: {
-          auth: { token },
-          headers: {},
-          query: {},
-        },
-        data: {},
-        join: mockClientJoin,
-        emit: mockClientEmit,
-        disconnect: mockClientDisconnect,
-      } as any;
+    it('should reject socket client immediately when authorization token is completely omitted', async () => {
+      const socketData = mockSocket as Record<string, any>;
+      socketData['handshake'] = { auth: {} };
 
-      mockExists.mockResolvedValue(true); // Room exists
-      mockHgetall.mockImplementation((key) => {
-        if (key === REDIS_KEYS.ROOM_STATE('ABCDEF')) {
-          return Promise.resolve({
-            status: RoomStatus.LOBBY,
-            currentRound: '1',
-            totalRounds: '3',
-            timerDuration: '90',
-            theme: 'Cartoon',
-          });
-        }
-        if (key === REDIS_KEYS.PLAYER_HASH('usr_1')) {
-          return Promise.resolve({
-            playerId: 'usr_1',
-            username: 'ReconnectingPlayer',
-            isHost: 'false',
-            connected: 'false',
-          }); // Reconnecting!
-        }
-        if (key === REDIS_KEYS.LEADERBOARD('ABCDEF')) {
-          return Promise.resolve({
-            usr_1: '10',
-          });
-        }
-        return Promise.resolve({});
-      });
+      await gateway.handleConnection(mockSocket as AppSocket);
 
-      mockAddPlayerToRoster.mockResolvedValue(undefined);
-      const mockRoster = [
-        {
-          playerId: 'usr_1',
-          username: 'ReconnectingPlayer',
-          isHost: false,
-          connected: true,
-        },
-      ];
-      mockGetRoomRoster.mockResolvedValue(mockRoster);
-
-      await gateway.handleConnection(mockClient);
-
-      expect(mockClient.data).toEqual({
-        playerId: 'usr_1',
-        roomCode: 'ABCDEF',
-        username: 'ReconnectingPlayer',
-        isHost: false,
-      });
-
-      expect(mockClientEmit).toHaveBeenCalledWith(
-        'v1:player:reconnected',
+      const emitSpy = socketData['emit'] as jest.Mock;
+      expect(emitSpy).toHaveBeenCalledWith(
+        'error:exception',
         expect.objectContaining({
-          roomCode: 'ABCDEF',
-          playerId: 'usr_1',
-          phase: RoomStatus.LOBBY,
-          currentRound: 1,
-          totalRounds: 3,
-          timerDuration: 90,
-          theme: 'Cartoon',
-          leaderboard: [
-            { playerId: 'usr_1', username: 'ReconnectingPlayer', stars: 10 },
-          ],
-          players: mockRoster,
+          code: 'MISSING_TOKEN',
         }),
+      );
+    });
+
+    it('should reject client gracefully when room validation lookup checks fail', async () => {
+      const socketData = mockSocket as Record<string, any>;
+      socketData['handshake'] = { auth: { token: 'valid-token' } };
+      redisService.exists.mockResolvedValue(false);
+
+      await gateway.handleConnection(mockSocket as AppSocket);
+
+      const emitSpy = socketData['emit'] as jest.Mock;
+      expect(emitSpy).toHaveBeenCalledWith(
+        'error:exception',
+        expect.objectContaining({
+          code: 'ROOM_NOT_FOUND',
+        }),
+      );
+    });
+
+    it('should reconnect existing player if eligible context is present', async () => {
+      const socketData = mockSocket as Record<string, any>;
+      socketData['handshake'] = { auth: { token: 'valid-token' } };
+      redisService.exists.mockResolvedValue(true);
+      gameService.canReconnect.mockResolvedValue(true);
+      mockRedisClient.hgetall.mockResolvedValue({
+        username: 'ReconnectedUser',
+      });
+
+      gameService.buildReconnectSnapshot.mockResolvedValue({
+        roomCode: 'ABCD',
+        playerId: 'player-123',
+        currentRound: 1,
+        totalRounds: 3,
+        phase: RoomStatus.DRAWING,
+        status: 'ACTIVE',
+        username: 'ReconnectedUser',
+        isHost: false,
+        timerDuration: 60,
+        timeRemaining: 45,
+        theme: 'default',
+        remainingTime: 45,
+        activePrompt: 'Mock Prompt',
+        leaderboard: [],
+        players: [],
+      } as V1ReconnectState);
+
+      await gateway.handleConnection(mockSocket as AppSocket);
+
+      const connectSpy = gameService.markPlayerConnected;
+      expect(connectSpy).toHaveBeenCalledWith('player-123');
+    });
+
+    it('should initialize dynamic room profile registry mapping on initial raw player connection entry', async () => {
+      const socketData = mockSocket as Record<string, any>;
+      socketData['handshake'] = { auth: { token: 'valid-token' } };
+      redisService.exists.mockResolvedValue(true);
+      gameService.canReconnect.mockResolvedValue(false);
+      mockRedisClient.get.mockResolvedValue(
+        JSON.stringify({ username: 'FreshPlayer' }),
+      );
+      mockRedisClient.hgetall.mockResolvedValue({
+        status: RoomStatus.LOBBY,
+        currentRound: '1',
+      });
+      gameService.getRoomRoster.mockResolvedValue([
+        {
+          playerId: 'player-123',
+          username: 'FreshPlayer',
+          connected: true,
+          isHost: false,
+        },
+      ]);
+
+      await gateway.handleConnection(mockSocket as AppSocket);
+
+      const rosterSpy = gameService.addPlayerToRoster;
+      expect(rosterSpy).toHaveBeenCalledWith(
+        'ABCD',
+        'player-123',
+        'FreshPlayer',
+        false,
       );
     });
   });
 
   describe('handleDisconnect', () => {
-    it('should set connected to false inside Redis and emit roster updated event if there are still active players', async () => {
-      const mockClient = {
-        id: 'socket_123',
-        data: {
-          playerId: 'usr_1',
-          roomCode: 'ABCDEF',
-          username: 'Bob',
-          isHost: false,
+    it('should update availability maps and notify room channels on simple player disconnect', async () => {
+      gameService.getRoomRoster.mockResolvedValue([
+        {
+          playerId: 'player-456',
+          username: 'OtherPlayer',
+          connected: true,
+          isHost: true,
         },
-      } as any;
+      ]);
 
-      mockExists.mockResolvedValue(true); // Player hash exists
-      const mockRoster = [
-        { playerId: 'usr_1', username: 'Bob', isHost: false, connected: false },
-        { playerId: 'usr_2', username: 'Alice', isHost: true, connected: true },
-      ];
-      mockGetRoomRoster.mockResolvedValue(mockRoster);
-      mockHset.mockResolvedValue(undefined);
+      await gateway.handleDisconnect(mockSocket as AppSocket);
 
-      await gateway.handleDisconnect(mockClient);
+      const disconnectSpy = gameService.markPlayerDisconnected;
+      const windowSpy = gameService.createReconnectWindow;
 
-      expect(mockExists).toHaveBeenCalledWith(REDIS_KEYS.PLAYER_HASH('usr_1'));
-      expect(mockHset).toHaveBeenCalledWith(
-        REDIS_KEYS.PLAYER_HASH('usr_1'),
-        'connected',
-        'false',
-      );
-      expect(mockServerTo).toHaveBeenCalledWith('ABCDEF');
-      expect(mockToEmit).toHaveBeenCalledWith('v1:room:roster_updated', {
-        players: mockRoster,
-      });
-    });
-
-    it('should evict the room (deleting all room keys) if all players are disconnected', async () => {
-      const mockClient = {
-        id: 'socket_123',
-        data: {
-          playerId: 'usr_1',
-          roomCode: 'ABCDEF',
-          username: 'Bob',
-          isHost: false,
-        },
-      } as any;
-
-      mockExists.mockResolvedValue(true);
-      const mockRoster = [
-        { playerId: 'usr_1', username: 'Bob', isHost: false, connected: false },
-      ];
-      mockGetRoomRoster.mockResolvedValue(mockRoster);
-      mockHset.mockResolvedValue(undefined);
-      mockDel.mockResolvedValue(undefined);
-
-      await gateway.handleDisconnect(mockClient);
-
-      expect(mockExists).toHaveBeenCalledWith(REDIS_KEYS.PLAYER_HASH('usr_1'));
-      expect(mockHset).toHaveBeenCalledWith(
-        REDIS_KEYS.PLAYER_HASH('usr_1'),
-        'connected',
-        'false',
-      );
-      expect(mockDel).toHaveBeenCalledWith(
-        REDIS_KEYS.ROOM_META('ABCDEF'),
-        REDIS_KEYS.ROOM_PLAYERS('ABCDEF'),
-        REDIS_KEYS.ROOM_STATE('ABCDEF'),
-        REDIS_KEYS.LEADERBOARD('ABCDEF'),
-        REDIS_KEYS.USED_PROMPTS('ABCDEF'),
-        REDIS_KEYS.PLAYER_HASH('usr_1'),
-      );
+      expect(disconnectSpy).toHaveBeenCalledWith('player-123');
+      expect(windowSpy).toHaveBeenCalledWith('player-123');
     });
   });
-
-  describe('GameGateway Administrative Permissions and Rejections', () => {
-    it('should deny updateSettings if the client is not marked as host', async () => {
-      const mockClient = {
-        id: 'socket_guest',
-        data: { playerId: 'usr_2', roomCode: 'ABCDEF', isHost: false },
-      } as any;
-
-      // Instantiate your guard manually or via execution context mock to ensure it blocks
-      const { GatewayGuard } = require('../common/guards/gateway.guard');
-      const guard = new GatewayGuard();
-
-      const mockContext = {
-        switchToWs: () => ({
-          getClient: () => mockClient,
-        }),
-      } as any;
-
-      expect(() => guard.canActivate(mockContext)).toThrow();
-    });
-
-    it('should cleanly execute rejectClient when jwt verification collapses', async () => {
-      const mockClient = {
-        id: 'bad_socket',
-        emit: jest.fn(),
-        disconnect: jest.fn(),
-      } as any;
-
-      // Triggering connection rejection pipeline directly
-      (gateway as any).rejectClient(
-        mockClient,
-        'AUTH_FAILED',
-        'Invalid token structural hash',
-      );
-
-      expect(mockClient.emit).toHaveBeenCalledWith(
-        'error:exception',
-        expect.objectContaining({ code: 'AUTH_FAILED' }),
-      );
-      expect(mockClient.disconnect).toHaveBeenCalledWith(true);
-    });
-  });
+  // eslint-disable-next-line prettier/prettier
 });

@@ -19,12 +19,12 @@ const RECONNECT_GRACE_SECONDS = 30;
 export class GameService {
   private readonly phaseTimers = new Map<string, NodeJS.Timeout>();
 
-  // 1. Define the private callback property
+  // Define the private callback property
   private phaseChangeCallback?: (roomCode: string, status: RoomStatus) => void;
 
   constructor(private readonly redisService: RedisService) {}
 
-  // 2. Add the registration method
+  // Add the registration method
   registerPhaseChangeCallback(
     callback: (roomCode: string, status: RoomStatus) => void,
   ): void {
@@ -81,10 +81,8 @@ export class GameService {
       roundEndTimestamp: String(roundEndTimestamp),
     });
 
-    // Synchronous callback wrapping the async execution to satisfy ESLint constraints
     const timer = setTimeout(() => {
       this.handlePhaseTimeout(roomCode).catch((err) => {
-        // Safe logging fallback for background job failure
         console.error(
           `[GameService] Phase timeout failure for room ${roomCode}:`,
           err,
@@ -96,16 +94,28 @@ export class GameService {
   }
 
   async handlePhaseTimeout(roomCode: string): Promise<void> {
-    // Destructure 'next' from the object returned by advancePhase
-    const { next } = await this.advancePhase(roomCode);
+    // 1. Core State Verification: Prevent lingering drawing timers from stepping
+    // on a GALLERY phase that was advanced early by submission completions.
+    const currentStatus = await this.getRoomStatus(roomCode);
+    if (currentStatus === RoomStatus.GALLERY) {
+      return;
+    }
+
+    const { next, currentRound } = await this.advancePhase(roomCode);
 
     switch (next) {
-      case RoomStatus.GALLERY:
-        await this.schedulePhaseTransition(
-          roomCode,
-          GAME_TIMERS.GALLERY_SECONDS,
-        );
+      case RoomStatus.GALLERY: {
+        const activeRound = currentRound ?? 1;
+        const gallery = await this.getGalleryOrder(roomCode, activeRound);
+
+        const dynamicGallerySeconds =
+          gallery.length > 0
+            ? gallery.length * GAME_TIMERS.VOTING_SECONDS_PER_CANVAS + 2
+            : GAME_TIMERS.GALLERY_SECONDS;
+
+        await this.schedulePhaseTransition(roomCode, dynamicGallerySeconds);
         break;
+      }
 
       case RoomStatus.ROUND_RESULTS:
         await this.schedulePhaseTransition(
@@ -120,8 +130,6 @@ export class GameService {
           .hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
 
         const drawingTime = Number(state.timerDuration ?? 90);
-
-        // Note: advancePhase already calls getUniquePrompt() right before transitioning to DRAWING.
         await this.schedulePhaseTransition(roomCode, drawingTime);
         break;
       }
@@ -192,15 +200,16 @@ export class GameService {
     return (status as RoomStatus) ?? RoomStatus.LOBBY;
   }
 
-  /**
-   * Cycles the target room status context forward.
-   * Fetches a new prompt if loop-cycling back into a fresh round.
-   */
   async advancePhase(roomCode: string): Promise<{
     next: RoomStatus;
     currentRound?: number;
     prompt?: string;
   }> {
+    // 2. CRITICAL BUG FIX: Explicitly terminate any active clock handle
+    // before modifying status strings. This shuts down any trailing timeouts
+    // when all players submit their canvases early.
+    this.clearPhaseTimer(roomCode);
+
     const current = await this.getRoomStatus(roomCode);
     let next: RoomStatus;
     let currentRound: number | undefined;
@@ -233,7 +242,6 @@ export class GameService {
             currentRound: String(currentRound),
           });
 
-          // Generate a brand new prompt before returning to DRAWING phase
           prompt = await this.getUniquePrompt(roomCode);
           next = RoomStatus.DRAWING;
         } else {
@@ -248,7 +256,6 @@ export class GameService {
 
     await this.updateRoomStatus(roomCode, next);
 
-    // 3. Fire callback safely after state update finishes execution
     this.phaseChangeCallback?.(roomCode, next);
 
     return {
@@ -423,7 +430,6 @@ export class GameService {
     round: number,
   ): Promise<GalleryEntry[]> {
     const redisClient = this.redisService.getClient();
-
     const drawingKeys = await redisClient.keys(
       `sti:v1:room:${roomCode}:round:${round}:player:*`,
     );
@@ -432,17 +438,29 @@ export class GameService {
 
     for (const key of drawingKeys) {
       const strokes = await redisClient.get(key);
+      if (!strokes) continue;
 
-      if (!strokes) {
-        continue;
-      }
+      const parts = key.split(':');
+      const artistId = parts[parts.length - 1] ?? '';
+      const parsedStrokes = JSON.parse(strokes) as unknown[];
 
       gallery.push({
         drawingId: randomUUID(),
-        strokes,
-      });
+        playerId: artistId,
+        strokes: parsedStrokes,
+      } as unknown as GalleryEntry);
     }
 
-    return gallery.sort(() => Math.random() - 0.5);
+    // ─── CRITICAL FIX: EXPLICIT FISHER-YATES ARRAY SHUFFLER FOR SPRINT 22 ───
+    for (let i = gallery.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const temp = gallery[i];
+      if (temp && gallery[j]) {
+        gallery[i] = gallery[j]!;
+        gallery[j] = temp;
+      }
+    }
+
+    return gallery;
   }
 }

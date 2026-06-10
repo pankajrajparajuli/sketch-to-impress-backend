@@ -1,4 +1,5 @@
 import { SubmitDrawingDto } from './dto/submit-drawing.dto';
+import { CastVoteDto } from './dto/cast-vote.dto';
 import { validateDrawingPayloadSize } from './validators/drawing-payload.validator';
 import { validateVectorOnlyPayload } from './validators/drawing-content.validator';
 import { Logger, UseGuards, UsePipes, ValidationPipe } from '@nestjs/common';
@@ -21,6 +22,7 @@ import { REDIS_KEYS } from '../redis/redis.keys';
 import { RoomStatus } from '../rooms/enums/room-status.enum';
 import { GameService } from './game.service';
 import { UpdateSettingsDto } from './dto/update-settings.dto';
+import { GAME_TIMERS } from './constants/game-timers';
 
 // ─── Decoded JWT shape ─────────────────────────────────────────────────────────
 interface JwtPayload {
@@ -35,6 +37,13 @@ interface CustomSocketData {
   roomCode: string;
   username: string;
   isHost: boolean;
+}
+
+// ─── Strongly Typed Gallery Struct mapping to avoid ESLint 'any' warnings ───
+interface ExtendedGalleryEntry {
+  drawingId: string;
+  playerId: string;
+  strokes: unknown[];
 }
 
 type AppSocket = Socket<any, any, any, CustomSocketData>;
@@ -67,12 +76,25 @@ export class GameGateway
   ) {}
 
   afterInit(): void {
-    // Register the shared automated callback listener
     this.gameService.registerPhaseChangeCallback((roomCode, status) => {
-      this.server.to(roomCode).emit('v1:game:phase_changed', {
-        roomCode,
-        status,
-      });
+      this.redis
+        .getClient()
+        .hgetall(REDIS_KEYS.ROOM_STATE(roomCode))
+        .then(async (roomState) => {
+          this.server.to(roomCode).emit('v1:game:phase_changed', {
+            roomCode,
+            status,
+          });
+
+          if (status === RoomStatus.GALLERY) {
+            const currentRound = Number(roomState.currentRound ?? 1);
+            await this.startGalleryCarousel(roomCode, currentRound);
+          }
+        })
+        .catch((err: unknown) => {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          this.logger.error(`[Phase change pipeline crash]: ${errMsg}`);
+        });
     });
 
     this.logger.log(
@@ -88,6 +110,12 @@ export class GameGateway
     roomCode: string,
     round: number,
   ): Promise<void> {
+    const activeTimer = this.galleryTimers.get(roomCode);
+    if (activeTimer) {
+      clearTimeout(activeTimer);
+      this.galleryTimers.delete(roomCode);
+    }
+
     const gallery = await this.gameService.getGalleryOrder(roomCode, round);
 
     if (gallery.length === 0) {
@@ -96,35 +124,75 @@ export class GameGateway
     }
 
     let index = 0;
+    const redisClient = this.redis.getClient();
 
-    const timer = setInterval(() => {
+    const runCarouselStep = async () => {
+      if (index >= gallery.length) {
+        this.galleryTimers.delete(roomCode);
+        await redisClient.hdel(
+          REDIS_KEYS.ROOM_STATE(roomCode),
+          'activeDrawingId',
+        );
+        await this.gameService.advancePhase(roomCode);
+        return;
+      }
+
       const drawing = gallery[index];
+
+      if (!drawing) {
+        this.galleryTimers.delete(roomCode);
+        await redisClient.hdel(
+          REDIS_KEYS.ROOM_STATE(roomCode),
+          'activeDrawingId',
+        );
+        await this.gameService.advancePhase(roomCode);
+        return;
+      }
+
+      const position = index + 1;
+      const total = gallery.length;
+
+      const safeDrawing = drawing as unknown as ExtendedGalleryEntry;
+      const targetDrawingId = safeDrawing.drawingId;
+
+      await redisClient.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
+        activeDrawingId: targetDrawingId,
+      });
+
+      // ─── TYPE-SAFE ANONYMITY MAP ───────────────────────────────────────────
+      // Explicitly map properties into a new object to omit 'playerId'.
+      // This completely avoids ESLint's unused variable rule warnings.
+      const anonymousDrawing = {
+        drawingId: safeDrawing.drawingId,
+        strokes: safeDrawing.strokes,
+      };
 
       this.server.to(roomCode).emit('v1:gallery:next_canvas', {
         roomCode,
         round,
-        position: index + 1,
-        total: gallery.length,
-        drawing,
+        position,
+        total,
+        drawing: anonymousDrawing,
+        votingSeconds: GAME_TIMERS.VOTING_SECONDS_PER_CANVAS,
       });
 
       index++;
 
-      if (index >= gallery.length) {
-        clearInterval(timer);
-        this.galleryTimers.delete(roomCode);
-      }
-    }, 12000);
+      const timer = setTimeout(() => {
+        runCarouselStep().catch((err: unknown) => {
+          const errMsg = err instanceof Error ? err.message : String(err);
+          this.logger.error(`Carousel step failure: ${errMsg}`);
+        });
+      }, GAME_TIMERS.VOTING_SECONDS_PER_CANVAS * 1000);
 
-    this.galleryTimers.set(roomCode, timer);
+      this.galleryTimers.set(roomCode, timer);
+    };
+
+    await runCarouselStep();
   }
 
   // ── WebSocket Ingestion Pipeline Event Listeners ─────────────────────────────
 
-  /**
-   * Temporary isolated debug signature handler to inspect inbound message integrity rules,
-   * isolating client serialization faults from structural payload pipeline blockers.
-   */
   @UsePipes(
     new ValidationPipe({
       whitelist: true,
@@ -168,6 +236,7 @@ export class GameGateway
           roomCode,
           currentRound,
           playerId,
+          strokeCount: 0,
         }),
       );
 
@@ -181,13 +250,11 @@ export class GameGateway
     const drawingKey = `sti:v1:room:${roomCode}:round:${currentRound}:player:${playerId}`;
     const submittedSet = REDIS_KEYS.ROUND_SUBMITTED_SET(roomCode, currentRound);
 
-    // Initialize atomic storage runtime pipeline grouping across storage boundaries
     const pipeline = redisClient.pipeline();
     pipeline.set(drawingKey, JSON.stringify(dto.strokes));
     pipeline.sadd(submittedSet, playerId);
     await pipeline.exec();
 
-    // Audit and process runtime submission indices for metrics logging
     const submittedCount = await redisClient.scard(submittedSet);
 
     this.logger.log(
@@ -200,7 +267,6 @@ export class GameGateway
       }),
     );
 
-    // Filter roster to evaluate dynamic, connection-aware submission progress thresholds
     const activePlayers = (
       await this.gameService.getRoomRoster(roomCode)
     ).filter((player) => player.connected);
@@ -215,7 +281,6 @@ export class GameGateway
       };
     }
 
-    // Secure a short-lived distribution lock to prevent multi-client mutation race conditions
     const transitionLockKey = REDIS_KEYS.ROUND_TRANSITION_LOCK(roomCode);
     const transitionLock = await redisClient.set(
       transitionLockKey,
@@ -242,7 +307,6 @@ export class GameGateway
       };
     }
 
-    // Final player submitted under lock security -> Trigger downstream phase advancement execution
     this.logger.log(
       JSON.stringify({
         event: 'all_players_submitted',
@@ -253,16 +317,13 @@ export class GameGateway
       }),
     );
 
-    await this.gameService.advancePhase(roomCode);
-
     const gallery = await this.gameService.buildGalleryPayload(
       roomCode,
       currentRound,
     );
 
     await this.gameService.cacheGalleryOrder(roomCode, currentRound, gallery);
-
-    await this.startGalleryCarousel(roomCode, currentRound);
+    await this.gameService.advancePhase(roomCode);
 
     return {
       success: true,
@@ -271,10 +332,81 @@ export class GameGateway
     };
   }
 
-  /**
-   * Intercepts host parameter modifications, persists changes to the volatile Redis cache layer,
-   * and broadcasts the fresh configuration matrices to all active session participants.
-   */
+  @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
+  @SubscribeMessage('v1:vote:cast_stars')
+  async castVote(
+    @ConnectedSocket() client: AppSocket,
+    @MessageBody() dto: CastVoteDto,
+  ): Promise<{ success: boolean }> {
+    const { playerId, roomCode } = client.data;
+    const redisClient = this.redis.getClient();
+
+    const roomState = await redisClient.hgetall(
+      REDIS_KEYS.ROOM_STATE(roomCode),
+    );
+
+    if (roomState.status !== RoomStatus.GALLERY) {
+      throw new Error('Voting is only permitted during the GALLERY phase.');
+    }
+
+    const activeDrawingId = roomState.activeDrawingId;
+    if (!activeDrawingId) {
+      this.logger.warn(
+        `Player ${playerId} voted but no active drawing index exists.`,
+      );
+      return { success: false };
+    }
+
+    const currentRound = Number(roomState.currentRound ?? 1);
+    const votersKey = REDIS_KEYS.VOTERS(
+      roomCode,
+      currentRound,
+      activeDrawingId,
+    );
+
+    const added = await redisClient.sadd(votersKey, playerId);
+
+    if (added === 0) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'duplicate_vote_blocked',
+          roomCode,
+          currentRound,
+          drawingId: activeDrawingId,
+          playerId,
+        }),
+      );
+
+      return { success: false };
+    }
+
+    const gallery = await this.gameService.getGalleryOrder(
+      roomCode,
+      currentRound,
+    );
+
+    const safeGallery = gallery as unknown as ExtendedGalleryEntry[];
+    const targetItem = safeGallery.find((g) => g.drawingId === activeDrawingId);
+
+    if (targetItem && targetItem.playerId) {
+      const leaderboardKey = REDIS_KEYS.LEADERBOARD(roomCode);
+      await redisClient.hincrby(leaderboardKey, targetItem.playerId, dto.stars);
+    }
+
+    this.logger.log(
+      JSON.stringify({
+        event: 'vote_recorded',
+        roomCode,
+        currentRound,
+        drawingId: activeDrawingId,
+        playerId,
+        stars: dto.stars,
+      }),
+    );
+
+    return { success: true };
+  }
+
   @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
   @UseGuards(GatewayGuard)
   @SubscribeMessage('v1:host:update_settings')
@@ -290,16 +422,11 @@ export class GameGateway
     this.server.to(roomCode).emit('v1:room:settings_updated', dto);
   }
 
-  /**
-   * Validates room context eligibility and advances the room status state out of the LOBBY phase.
-   * Leverages a short-lived Redis NX lock to guarantee atomicity and prevent double-start race conditions.
-   */
   @UseGuards(GatewayGuard)
   @SubscribeMessage('v1:host:start_game')
   async startGame(@ConnectedSocket() client: AppSocket): Promise<void> {
     const { roomCode } = client.data;
 
-    // 1. Acquire distributed lock (5-second expiration window) to prevent rapid multi-clicks
     const redisClient = this.redis.getClient();
     const locked = await redisClient.set(
       REDIS_KEYS.GAME_START_LOCK(roomCode),
@@ -321,31 +448,25 @@ export class GameGateway
       return;
     }
 
-    // 2. Validate current state status under full mutation isolation
     const status = await this.gameService.getRoomStatus(roomCode);
 
     if (status !== RoomStatus.LOBBY) {
       return;
     }
 
-    // 3. Commit state changes, advancing phase and initializing the round parameter structure
     await redisClient.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
       status: RoomStatus.DRAWING,
       currentRound: '1',
     });
 
-    // 4. Fetch a unique random prompt based on the room's chosen theme
     const prompt = await this.gameService.getUniquePrompt(roomCode);
 
-    // 5. Broadcast initial round configuration
-    // (Note: phase_changed broadcast handled by service callback injection points)
     this.server.to(roomCode).emit('v1:round:started', {
       roomCode,
       round: 1,
       prompt,
     });
 
-    // 6. Schedule downstream automated phase timeout tracking vectors
     const roomState = await this.redis
       .getClient()
       .hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
@@ -355,40 +476,10 @@ export class GameGateway
     await this.gameService.schedulePhaseTransition(roomCode, duration);
   }
 
-  /**
-   * Evaluates chronological state flow indices, shifting game rooms cleanly into structural adjacent loops.
-   * Handles round iteration payload distributions cleanly if loops step back into DRAWING status configurations.
-   */
   @SubscribeMessage('v1:debug:advance_phase')
   async advancePhase(@ConnectedSocket() client: AppSocket): Promise<void> {
     const { roomCode } = client.data;
-
-    // Destructure the returned configuration payload from the newly refactored service method
-    const { next, currentRound, prompt } =
-      await this.gameService.advancePhase(roomCode);
-
-    // If the room cycled back into a fresh DRAWING phase loop and carries valid configuration parameters, dispatch events
-    // (Note: phase_changed broadcast handled by service callback injection points)
-    if (next === RoomStatus.DRAWING && prompt) {
-      this.server.to(roomCode).emit('v1:round:started', {
-        roomCode,
-        round: currentRound ?? 1,
-        prompt,
-      });
-    }
-
-    if (next === RoomStatus.GALLERY) {
-      const roundNumber = currentRound ?? 1;
-
-      const gallery = await this.gameService.buildGalleryPayload(
-        roomCode,
-        roundNumber,
-      );
-
-      await this.gameService.cacheGalleryOrder(roomCode, roundNumber, gallery);
-
-      await this.startGalleryCarousel(roomCode, roundNumber);
-    }
+    await this.gameService.advancePhase(roomCode);
   }
 
   // ── Client Connection ─────────────────────────────────────────────────────────
