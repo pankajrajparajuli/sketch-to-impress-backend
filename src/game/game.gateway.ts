@@ -124,11 +124,14 @@ export class GameGateway
               serverTime: Date.now(),
             });
           } else if (status === RoomStatus.FINAL_RESULTS) {
-            const standings =
-              await this.gameService.buildRoundStandings(roomCode);
+            // 🛠️ Integrates cumulative match results and emits podium state downstream
+            const results = await this.gameService.buildMatchResults(roomCode);
+
+            this.server.to(roomCode).emit('v1:game:match_over', results);
+
             this.server.to(roomCode).emit('v1:game:final_results_started', {
               roomCode,
-              standings,
+              standings: results.standings,
               serverTime: Date.now(),
             });
           }

@@ -14,6 +14,10 @@ import { randomUUID } from 'crypto';
 import { GalleryEntry } from './interfaces/v1-gallery-entry.interface';
 import { RoundResultEntry } from './interfaces/v1-round-results.interface';
 import { CleanupService } from '../common/services/cleanup.service';
+import {
+  FinalResultEntry,
+  MatchOverPayload,
+} from './interfaces/v1-final-result.interface'; // Adjust path if needed
 
 const RECONNECT_GRACE_SECONDS = 30;
 
@@ -565,5 +569,37 @@ export class GameService {
       ...entry,
       rank: index + 1,
     }));
+  }
+
+  // ─── FINAL STANDINGS & PODIUM BUILDER ──────────────────────────────────────
+
+  async buildFinalStandings(roomCode: string): Promise<FinalResultEntry[]> {
+    const redis = this.redisService.getClient();
+
+    const leaderboard = await redis.hgetall(REDIS_KEYS.LEADERBOARD(roomCode));
+
+    const roster = await this.getRoomRoster(roomCode);
+
+    const standings = roster.map((player) => ({
+      playerId: player.playerId,
+      username: player.username,
+      score: Number(leaderboard[player.playerId] ?? 0),
+    }));
+
+    standings.sort((a, b) => b.score - a.score);
+
+    return standings.map((entry, index) => ({
+      ...entry,
+      rank: index + 1,
+    }));
+  }
+
+  async buildMatchResults(roomCode: string): Promise<MatchOverPayload> {
+    const standings = await this.buildFinalStandings(roomCode);
+
+    return {
+      podium: standings.slice(0, 3),
+      standings,
+    };
   }
 }
