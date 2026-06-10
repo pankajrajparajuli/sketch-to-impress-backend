@@ -387,7 +387,25 @@ export class GameGateway
 
     const safeGallery = gallery as unknown as ExtendedGalleryEntry[];
     const targetItem = safeGallery.find((g) => g.drawingId === activeDrawingId);
+    if (!targetItem) {
+      return { success: false };
+    }
 
+    if (targetItem.playerId === playerId) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'self_vote_blocked',
+          roomCode,
+          currentRound,
+          drawingId: activeDrawingId,
+          playerId,
+        }),
+      );
+
+      return {
+        success: false,
+      };
+    }
     if (targetItem && targetItem.playerId) {
       const leaderboardKey = REDIS_KEYS.LEADERBOARD(roomCode);
       await redisClient.hincrby(leaderboardKey, targetItem.playerId, dto.stars);
