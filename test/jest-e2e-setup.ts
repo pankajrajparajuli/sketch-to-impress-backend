@@ -1,0 +1,3 @@
+process.env.VOTING_SECONDS_PER_CANVAS = '5';
+process.env.RECONNECT_GRACE_SECONDS = '1';
+process.env.HOST_MIGRATION_GRACE_MS = '2000';

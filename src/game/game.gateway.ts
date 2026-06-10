@@ -77,6 +77,7 @@ export class GameGateway
 
   private readonly logger = new Logger(GameGateway.name);
   private readonly galleryTimers = new Map<string, NodeJS.Timeout>();
+  private readonly hostMigrationTimers = new Map<string, NodeJS.Timeout>();
 
   constructor(
     private readonly redis: RedisService,
@@ -379,7 +380,7 @@ export class GameGateway
       }),
     );
 
-    await this.advanceGalleryCanvas(roomCode, currentRound);
+    void this.advanceGalleryCanvas(roomCode, currentRound);
   }
 
   @OnEvent('PLAYER_LEFT')
@@ -405,6 +406,21 @@ export class GameGateway
       clearTimeout(timer);
       this.galleryTimers.delete(roomCode);
     }
+  }
+
+  /** Clears all in-memory gallery carousel timers — used by E2E suite teardown between cases. */
+  clearAllGalleryTimersForTest(): void {
+    for (const roomCode of [...this.galleryTimers.keys()]) {
+      this.clearGalleryTimer(roomCode);
+    }
+  }
+
+  /** Clears pending host migration timers — used by E2E suite teardown between cases. */
+  clearAllHostMigrationTimersForTest(): void {
+    for (const timer of this.hostMigrationTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.hostMigrationTimers.clear();
   }
 
   private async advanceGalleryCanvas(
@@ -680,7 +696,7 @@ export class GameGateway
         }),
       );
 
-      await this.advanceGalleryCanvas(roomCode, currentRound);
+      void this.advanceGalleryCanvas(roomCode, currentRound);
     }
 
     return { success: true };
@@ -987,7 +1003,15 @@ export class GameGateway
       );
 
       if (isHost) {
-        setTimeout(() => {
+        const existingMigrationTimer =
+          this.hostMigrationTimers.get(playerId);
+        if (existingMigrationTimer) {
+          clearTimeout(existingMigrationTimer);
+        }
+
+        const migrationTimer = setTimeout(() => {
+          this.hostMigrationTimers.delete(playerId);
+
           const runMigration = async (): Promise<void> => {
             const stillDisconnected =
               !(await this.gameService.canReconnect(playerId));
@@ -1027,7 +1051,9 @@ export class GameGateway
               }),
             );
           });
-        }, 30000);
+        }, Number(process.env.HOST_MIGRATION_GRACE_MS ?? 30000));
+
+        this.hostMigrationTimers.set(playerId, migrationTimer);
       }
 
       await this.gameService.checkRoomOccupancy(roomCode);

@@ -435,6 +435,9 @@ describe('GameGateway', () => {
         stars: 8,
       });
 
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+
       expect(result).toEqual({ success: true });
       expect(mockRedisClient.hincrby).toHaveBeenCalledWith(
         REDIS_KEYS.LEADERBOARD('ABCD'),
@@ -676,6 +679,9 @@ describe('GameGateway', () => {
         roomCode: 'ABCD',
         playerId: 'player-dropped',
       });
+
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
 
       expect(gameService.advancePhase).toHaveBeenCalledWith('ABCD');
     });

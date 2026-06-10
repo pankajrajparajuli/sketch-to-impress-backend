@@ -19,7 +19,11 @@ import {
   MatchOverPayload,
 } from './interfaces/v1-final-result.interface';
 
-const RECONNECT_GRACE_SECONDS = 30;
+const DEFAULT_RECONNECT_GRACE_SECONDS = 30;
+
+function getReconnectGraceSeconds(): number {
+  return Number(process.env.RECONNECT_GRACE_SECONDS ?? DEFAULT_RECONNECT_GRACE_SECONDS);
+}
 
 @Injectable()
 export class GameService {
@@ -50,6 +54,13 @@ export class GameService {
 
     clearTimeout(timer);
     this.phaseTimers.delete(roomCode);
+  }
+
+  /** Clears all in-memory phase timers — used by E2E suite teardown between cases. */
+  clearAllPhaseTimersForTest(): void {
+    for (const roomCode of [...this.phaseTimers.keys()]) {
+      this.clearPhaseTimer(roomCode);
+    }
   }
 
   // ─── GALLERY INDEX REDIS PERSISTENCE HELPERS (SPRINT 24 PART 1) ───────────
@@ -397,7 +408,7 @@ export class GameService {
       REDIS_KEYS.PLAYER_RECONNECT(playerId),
       'pending',
       'EX',
-      RECONNECT_GRACE_SECONDS,
+      getReconnectGraceSeconds(),
     );
   }
 
