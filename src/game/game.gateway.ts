@@ -47,7 +47,13 @@ interface ExtendedGalleryEntry {
   strokes: unknown[];
 }
 
-type AppSocket = Socket<any, any, any, CustomSocketData>;
+// 🚀 FIX TS2344: Explicit object indexes mapped to satisfy strict EventsMap constraints
+type AppSocket = Socket<
+  Record<string, any>,
+  Record<string, any>,
+  Record<string, any>,
+  CustomSocketData
+>;
 
 @WebSocketGateway({
   namespace: '/game',
@@ -93,7 +99,6 @@ export class GameGateway
             const currentRound = Number(roomState.currentRound ?? 1);
             await this.startGalleryCarousel(roomCode, currentRound);
           } else if (status === RoomStatus.ROUND_RESULTS) {
-            // 🚀 SPRINT 26 CORRECTION: Handle scoreboard view payload setup
             const currentRound = Number(roomState.currentRound ?? 1);
             const standings =
               await this.gameService.buildRoundStandings(roomCode);
@@ -106,7 +111,6 @@ export class GameGateway
               serverTime: Date.now(),
             });
           } else if (status === RoomStatus.DRAWING) {
-            // Mid-game round advancement for round 2, 3, etc.
             const currentRound = Number(roomState.currentRound ?? 1);
             const prompt =
               roomState.activePrompt ??
@@ -155,11 +159,11 @@ export class GameGateway
     }
 
     const gallery = await this.gameService.getGalleryOrder(roomCode, round);
+    const redisClient = this.redis.getClient();
 
     if (gallery.length === 0) {
       const standings = await this.gameService.buildRoundStandings(roomCode);
 
-      // Emitting the completion events before triggering state engine advancement mutations
       this.server.to(roomCode).emit('v1:game:round_complete', {
         roomCode,
         round,
@@ -171,16 +175,20 @@ export class GameGateway
     }
 
     let index = await this.gameService.getGalleryIndex(roomCode, round);
-    const redisClient = this.redis.getClient();
 
     const runCarouselStep = async () => {
-      // 🚀 FIX: Catch natural layout progression indexing out-of-bounds bounds cleanly
       if (index >= gallery.length) {
         this.galleryTimers.delete(roomCode);
-        await redisClient.hdel(
+
+        // Clear hanging track data cleanly via pipeline before phase advancement mutation executes
+        const pipeline = redisClient.pipeline();
+        pipeline.hdel(
           REDIS_KEYS.ROOM_STATE(roomCode),
           'activeDrawingId',
+          'galleryEndTimestamp',
         );
+        await pipeline.exec();
+
         await this.gameService.deleteGalleryIndex(roomCode, round);
 
         const standings = await this.gameService.buildRoundStandings(roomCode);
@@ -198,10 +206,15 @@ export class GameGateway
 
       if (!drawing) {
         this.galleryTimers.delete(roomCode);
-        await redisClient.hdel(
+
+        const pipeline = redisClient.pipeline();
+        pipeline.hdel(
           REDIS_KEYS.ROOM_STATE(roomCode),
           'activeDrawingId',
+          'galleryEndTimestamp',
         );
+        await pipeline.exec();
+
         await this.gameService.deleteGalleryIndex(roomCode, round);
 
         const standings = await this.gameService.buildRoundStandings(roomCode);
@@ -221,21 +234,18 @@ export class GameGateway
       const safeDrawing = drawing as unknown as ExtendedGalleryEntry;
       const targetDrawingId = safeDrawing.drawingId;
 
+      const galleryEndTimestamp =
+        Date.now() + GAME_TIMERS.VOTING_SECONDS_PER_CANVAS * 1000;
+
       await redisClient.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
         activeDrawingId: targetDrawingId,
+        galleryEndTimestamp: String(galleryEndTimestamp),
       });
 
       const anonymousDrawing = {
         drawingId: safeDrawing.drawingId,
         strokes: safeDrawing.strokes,
       };
-
-      const galleryEndTimestamp =
-        Date.now() + GAME_TIMERS.VOTING_SECONDS_PER_CANVAS * 1000;
-
-      await redisClient.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
-        galleryEndTimestamp: String(galleryEndTimestamp),
-      });
 
       this.server.to(roomCode).emit('v1:gallery:next_canvas', {
         roomCode,
@@ -610,7 +620,7 @@ export class GameGateway
       return { success: false };
     }
 
-    if (targetItem && targetItem.playerId) {
+    if (targetItem.playerId) {
       const leaderboardKey = REDIS_KEYS.LEADERBOARD(roomCode);
       await redisClient.hincrby(leaderboardKey, targetItem.playerId, dto.stars);
     }
@@ -820,6 +830,7 @@ export class GameGateway
           roomCode,
           playerId,
         );
+        // 🚀 FIX TS2345: Resolves argument constraints safely
         client.emit('v1:player:reconnected', snapshot);
 
         this.logger.log(
@@ -930,7 +941,7 @@ export class GameGateway
             }
           };
 
-          runMigration().catch((err) => {
+          runMigration().catch((err: unknown) => {
             const message =
               err instanceof Error
                 ? err.message
@@ -978,6 +989,7 @@ export class GameGateway
         socketId: client.id,
       }),
     );
+    // 🚀 FIX TS2345: Resolves structural event signature mapping cleanly
     client.emit('error:exception', { success: false, code, message });
     client.disconnect(true);
   }

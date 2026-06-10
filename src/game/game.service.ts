@@ -13,6 +13,7 @@ import { GAME_TIMERS } from './constants/game-timers';
 import { randomUUID } from 'crypto';
 import { GalleryEntry } from './interfaces/v1-gallery-entry.interface';
 import { RoundResultEntry } from './interfaces/v1-round-results.interface';
+import { CleanupService } from '../common/services/cleanup.service';
 
 const RECONNECT_GRACE_SECONDS = 30;
 
@@ -23,7 +24,10 @@ export class GameService {
   // Define the private callback property
   private phaseChangeCallback?: (roomCode: string, status: RoomStatus) => void;
 
-  constructor(private readonly redisService: RedisService) {}
+  constructor(
+    private readonly redisService: RedisService,
+    private readonly cleanupService: CleanupService, // Injected Hooks Provider
+  ) {}
 
   // Add the registration method
   registerPhaseChangeCallback(
@@ -110,10 +114,12 @@ export class GameService {
     });
 
     const timer = setTimeout(() => {
-      this.handlePhaseTimeout(roomCode).catch((err) => {
+      this.handlePhaseTimeout(roomCode).catch((err: unknown) => {
+        const errorMessage =
+          err instanceof Error ? err.message : 'Unknown phase timeout error';
         console.error(
           `[GameService] Phase timeout failure for room ${roomCode}:`,
-          err,
+          errorMessage,
         );
       });
     }, durationSeconds * 1000);
@@ -122,8 +128,6 @@ export class GameService {
   }
 
   async handlePhaseTimeout(roomCode: string): Promise<void> {
-    // 1. Core State Verification: Prevent lingering drawing timers from stepping
-    // on a GALLERY phase that was advanced early by submission completions.
     const currentStatus = await this.getRoomStatus(roomCode);
     if (currentStatus === RoomStatus.GALLERY) {
       return;
@@ -146,7 +150,6 @@ export class GameService {
       }
 
       case RoomStatus.ROUND_RESULTS:
-        // Handled internally during the programmatic phase mutation step inside advancePhase()
         break;
 
       case RoomStatus.DRAWING: {
@@ -230,15 +233,18 @@ export class GameService {
     currentRound?: number;
     prompt?: string;
   }> {
-    // 2. CRITICAL BUG FIX: Explicitly terminate any active clock handle
-    // before modifying status strings. This shuts down any trailing timeouts
-    // when all players submit their canvases early.
     this.clearPhaseTimer(roomCode);
 
     const current = await this.getRoomStatus(roomCode);
     let next: RoomStatus;
     let currentRound: number | undefined;
     let prompt: string | undefined;
+
+    const redis = this.redisService.getClient();
+    const state = await redis.hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
+    const roster = await this.getRoomRoster(roomCode);
+    const playerIds = roster.map((p) => p.playerId);
+    const totalRounds = Number(state.totalRounds ?? 3);
 
     switch (current) {
       case RoomStatus.LOBBY:
@@ -249,16 +255,22 @@ export class GameService {
         next = RoomStatus.GALLERY;
         break;
 
-      case RoomStatus.GALLERY:
+      case RoomStatus.GALLERY: {
         next = RoomStatus.ROUND_RESULTS;
+
+        // 🛠️ Hook #1 — ROUND_RESULTS Entry
+        // Instantly and aggressively reclaims canvas memory across the roster.
+        const targetRound = Number(state.currentRound ?? 1);
+        await this.cleanupService.cleanupRoundStrokes(
+          roomCode,
+          targetRound,
+          playerIds,
+        );
         break;
+      }
 
       case RoomStatus.ROUND_RESULTS: {
-        const redis = this.redisService.getClient();
-        const state = await redis.hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
-
         const roundData = Number(state.currentRound ?? 1);
-        const totalRounds = Number(state.totalRounds ?? 3);
 
         if (roundData < totalRounds) {
           currentRound = roundData + 1;
@@ -281,9 +293,6 @@ export class GameService {
 
     await this.updateRoomStatus(roomCode, next);
 
-    // 🚀 SPRINT 26 FIX: Automatically schedule the 10-second timer when we enter ROUND_RESULTS.
-    // This ensures that the game engine ticks over automatically even if advanced programmatically
-    // via a clean gateway method execution loop.
     if (next === RoomStatus.ROUND_RESULTS) {
       await this.schedulePhaseTransition(
         roomCode,
@@ -291,7 +300,26 @@ export class GameService {
       );
     }
 
+    // Fires synchronous gateway handling loop (transmits final score data downstream)
     this.phaseChangeCallback?.(roomCode, next);
+
+    // 🛠️ Hook #2 — FINAL_RESULTS Delay
+    // Reclaims match data cleanly after clients read podium snapshots.
+    if (next === RoomStatus.FINAL_RESULTS) {
+      const gracePeriodSeconds = 30; // 30-second safe buffer for client UI rendering
+      setTimeout(() => {
+        this.cleanupService
+          .cleanupMatch(roomCode, totalRounds, playerIds)
+          .catch((err: unknown) => {
+            const errorMessage =
+              err instanceof Error ? err.message : 'Unknown cleanup error';
+            console.error(
+              `[GameService] Deterministic cleanup failure for room ${roomCode}:`,
+              errorMessage,
+            );
+          });
+      }, gracePeriodSeconds * 1000);
+    }
 
     return {
       next,
@@ -393,11 +421,9 @@ export class GameService {
   }
 
   async cleanupRoom(roomCode: string): Promise<void> {
-    const redis = this.redisService.getClient();
-    const keys = await redis.keys(`sti:v1:room:${roomCode}:*`);
-
-    if (keys.length === 0) return;
-    await redis.del(...keys);
+    const roster = await this.getRoomRoster(roomCode);
+    const playerIds = roster.map((p) => p.playerId);
+    await this.cleanupService.cleanupMatch(roomCode, 3, playerIds);
   }
 
   async migrateHost(roomCode: string): Promise<RoomPlayer | null> {
@@ -451,7 +477,6 @@ export class GameService {
       );
     }
 
-    // 🚀 SPRINT 26 FIX: Make sure remaining seconds is accurately compiled for ROUND_RESULTS phase drops
     if (state.status === RoomStatus.ROUND_RESULTS && state.roundEndTimestamp) {
       remainingSeconds = Math.max(
         0,
@@ -493,23 +518,20 @@ export class GameService {
     round: number,
   ): Promise<GalleryEntry[]> {
     const redisClient = this.redisService.getClient();
-    const drawingKeys = await redisClient.keys(
-      `sti:v1:room:${roomCode}:round:${round}:player:*`,
-    );
+    const roster = await this.getRoomRoster(roomCode);
 
     const gallery: GalleryEntry[] = [];
 
-    for (const key of drawingKeys) {
+    for (const player of roster) {
+      const key = `sti:v1:room:${roomCode}:round:${round}:player:${player.playerId}`;
       const strokes = await redisClient.get(key);
       if (!strokes) continue;
 
-      const parts = key.split(':');
-      const artistId = parts[parts.length - 1] ?? '';
       const parsedStrokes = JSON.parse(strokes) as unknown[];
 
       gallery.push({
         drawingId: randomUUID(),
-        playerId: artistId,
+        playerId: player.playerId,
         strokes: parsedStrokes,
       } as unknown as GalleryEntry);
     }
@@ -528,9 +550,7 @@ export class GameService {
 
   async buildRoundStandings(roomCode: string): Promise<RoundResultEntry[]> {
     const redis = this.redisService.getClient();
-
     const leaderboard = await redis.hgetall(REDIS_KEYS.LEADERBOARD(roomCode));
-
     const roster = await this.getRoomRoster(roomCode);
 
     const standings = roster.map((player) => ({
