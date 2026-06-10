@@ -66,6 +66,32 @@ describe('STI Backend E2E Integration Suite (Sprint 30)', () => {
         .expect({ status: 'ok' });
     });
 
+    it('requires username (max 15) to create and join a lobby', async () => {
+      await request(ctx.httpServer)
+        .post('/api/v1/rooms/create')
+        .send({})
+        .expect(400);
+
+      await request(ctx.httpServer)
+        .post('/api/v1/rooms/create')
+        .send({ username: 'a'.repeat(16) })
+        .expect(400);
+
+      const room = await createRoom(ctx.httpServer, 'HostName');
+      expect(room.playerId).toBe(room.hostId);
+      expect(room.username).toBe('HostName');
+
+      await request(ctx.httpServer)
+        .post('/api/v1/rooms/join')
+        .send({ roomCode: room.roomCode })
+        .expect(400);
+
+      const guest = await joinRoom(ctx.httpServer, room.roomCode, 'Guest');
+      expect(guest.playerId).toBeDefined();
+      expect(guest.username).toBe('Guest');
+      expect(guest.hostId).toBe(room.hostId);
+    });
+
     it('stores all session keys under the versioned sti:v1 prefix only', async () => {
       const room = await createRoom(ctx.httpServer);
       await joinRoom(ctx.httpServer, room.roomCode, 'Guest');

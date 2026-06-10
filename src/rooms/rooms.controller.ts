@@ -1,6 +1,7 @@
 import { Body, Controller, Post, HttpCode, HttpStatus } from '@nestjs/common';
 import { RoomsService } from './rooms.service';
 import { JoinRoomDto } from './dto/join-room.dto';
+import { CreateRoomDto } from './dto/create-room.dto';
 
 @Controller('/api/v1/rooms')
 export class RoomsController {
@@ -9,8 +10,8 @@ export class RoomsController {
   // ── POST /api/v1/rooms/create ─────────────────────────────────────────────
   @Post('/create')
   @HttpCode(HttpStatus.CREATED)
-  async createRoom() {
-    return this.roomsService.createRoom();
+  async createRoom(@Body() dto: CreateRoomDto) {
+    return this.roomsService.createRoom(dto);
   }
 
   // ── POST /api/v1/rooms/join ───────────────────────────────────────────────

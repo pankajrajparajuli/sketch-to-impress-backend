@@ -1,5 +1,5 @@
 import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication } from '@nestjs/common';
+import { INestApplication, ValidationPipe } from '@nestjs/common';
 import * as request from 'supertest';
 import { io, Socket as ClientSocket } from 'socket.io-client';
 import { AppModule } from '../../src/app.module';
@@ -10,15 +10,19 @@ import { Server } from 'http';
 export interface CreateRoomResponse {
   success: boolean;
   roomCode: string;
-  reconnectToken: string;
+  playerId: string;
   hostId: string;
+  username: string;
+  reconnectToken: string;
 }
 
 export interface JoinRoomResponse {
   success: boolean;
   roomCode: string;
-  reconnectToken: string;
   playerId: string;
+  username: string;
+  hostId: string;
+  reconnectToken: string;
 }
 
 export const MINIMAL_STROKES = [
@@ -56,6 +60,13 @@ export async function bootstrapE2EApp(): Promise<E2EContext> {
   }).compile();
 
   const app = moduleFixture.createNestApplication();
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: true,
+    }),
+  );
   await app.init();
 
   const httpServer = app.getHttpServer() as Server;
@@ -78,9 +89,11 @@ export async function teardownE2EApp(ctx: E2EContext): Promise<void> {
 
 export async function createRoom(
   httpServer: Server,
+  username = 'HostUser',
 ): Promise<CreateRoomResponse> {
   const response = await request(httpServer)
     .post('/api/v1/rooms/create')
+    .send({ username })
     .expect(201);
 
   return response.body as CreateRoomResponse;
@@ -220,7 +233,7 @@ export async function setupTwoPlayerRoom(ctx: E2EContext): Promise<{
     roomCode: createBody.roomCode,
     hostSocket,
     guestSocket,
-    hostId: createBody.hostId,
+    hostId: createBody.playerId,
     guestId: joinBody.playerId,
   };
 }

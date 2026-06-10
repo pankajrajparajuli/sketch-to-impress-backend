@@ -14,6 +14,9 @@ describe('RoomsService (Unit)', () => {
   let mockHget: ReturnType<
     typeof jest.fn<(key: string, field: string) => Promise<string | null>>
   >;
+  let mockHgetall: ReturnType<
+    typeof jest.fn<(key: string) => Promise<Record<string, string>>>
+  >;
   let mockScard: ReturnType<typeof jest.fn<(key: string) => Promise<number>>>;
   let mockKeys: ReturnType<
     typeof jest.fn<(pattern: string) => Promise<string[]>>
@@ -27,6 +30,8 @@ describe('RoomsService (Unit)', () => {
     mockExists = jest.fn<(key: string) => Promise<number>>();
     mockHget =
       jest.fn<(key: string, field: string) => Promise<string | null>>();
+    mockHgetall =
+      jest.fn<(key: string) => Promise<Record<string, string>>>();
     mockScard = jest.fn<(key: string) => Promise<number>>();
     mockKeys = jest.fn<(pattern: string) => Promise<string[]>>();
     mockSetex = jest.fn();
@@ -45,6 +50,7 @@ describe('RoomsService (Unit)', () => {
     const mockRedisService = {
       exists: mockExists,
       hget: mockHget,
+      hgetall: mockHgetall,
       touchRoom: jest.fn<() => Promise<void>>().mockResolvedValue(),
       getClient: () => ({
         scard: mockScard,
@@ -73,11 +79,14 @@ describe('RoomsService (Unit)', () => {
 
   // ─── CASE 4: CREATE ROOM SUCCESS ──────────────────────────────────────────
   it('should successfully initialize a room and seed host reservation', async () => {
-    const result = await roomsService.createRoom();
+    const dto = { username: 'HostUser' };
+    const result = await roomsService.createRoom(dto);
 
     expect(result.success).toBe(true);
     expect(result.roomCode).toBe('MBCVGY');
+    expect(result.playerId).toBe(result.hostId);
     expect(result.hostId).toBeDefined();
+    expect(result.username).toBe('HostUser');
     expect(result.reconnectToken).toBeDefined();
 
     expect(mockHset).toHaveBeenCalledTimes(2); // ROOM_META and ROOM_STATE
@@ -89,6 +98,7 @@ describe('RoomsService (Unit)', () => {
   // ─── CASE 5: JOIN ROOM SUCCESS ────────────────────────────────────────────
   it('should allow a player to reserve a slot if room is valid and not full', async () => {
     mockExists.mockResolvedValue(1);
+    mockHgetall.mockResolvedValue({ hostId: 'usr_host1' });
     mockHget.mockResolvedValue(RoomStatus.LOBBY);
     mockScard.mockResolvedValue(2);
     mockKeys.mockResolvedValue(['res1', 'res2']);
@@ -98,6 +108,8 @@ describe('RoomsService (Unit)', () => {
 
     expect(result.success).toBe(true);
     expect(result.playerId).toBeDefined();
+    expect(result.username).toBe('DoodleBob');
+    expect(result.hostId).toBe('usr_host1');
     expect(result.reconnectToken).toBeDefined();
     expect(mockSetex).toHaveBeenCalledTimes(1);
   });
@@ -136,7 +148,7 @@ describe('RoomsService (Unit)', () => {
 
   // ─── CASE 9: TOKEN VALIDITY CHECKS ─────────────────────────────────────────
   it('should generate a token containing valid claims during room initialization', async () => {
-    const result = await roomsService.createRoom();
+    const result = await roomsService.createRoom({ username: 'HostUser' });
 
     const token = result.reconnectToken;
     expect(typeof token).toBe('string');

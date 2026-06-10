@@ -378,6 +378,9 @@ export class GameService {
 
     if (!playerIds || playerIds.length === 0) return [];
 
+    const roomMeta = await redis.hgetall(REDIS_KEYS.ROOM_META(roomCode));
+    const authoritativeHostId = roomMeta?.hostId ?? '';
+
     const pipeline = redis.pipeline();
     playerIds.forEach((playerId) => {
       pipeline.hgetall(REDIS_KEYS.PLAYER_HASH(playerId));
@@ -389,12 +392,20 @@ export class GameService {
     return results
       .map((result) => result[1] as Record<string, string> | null)
       .filter((player): player is Record<string, string> => !!player)
-      .map((player) => ({
-        playerId: player.playerId ?? '',
-        username: player.username ?? '',
-        isHost: player.isHost === 'true',
-        connected: player.connected === 'true',
-      }));
+      .map((player) => {
+        const playerId = player.playerId ?? '';
+        const isHost = player.isHost === 'true';
+
+        return {
+          playerId,
+          username: player.username ?? '',
+          isHost,
+          connected: player.connected === 'true',
+          ...(isHost
+            ? { hostId: authoritativeHostId || playerId }
+            : {}),
+        };
+      });
   }
 
   async markPlayerDisconnected(playerId: string): Promise<void> {

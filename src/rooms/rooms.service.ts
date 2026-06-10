@@ -8,6 +8,7 @@ import { CodeGenerator } from 'src/common/utils/code-generator';
 import { REDIS_KEYS } from 'src/redis/redis.keys';
 import { RoomStatus } from './enums/room-status.enum';
 import { JoinRoomDto } from './dto/join-room.dto';
+import { CreateRoomDto } from './dto/create-room.dto';
 import * as jwt from 'jsonwebtoken';
 
 // ─── Game Constants ────────────────────────────────────────────────────────────
@@ -24,7 +25,8 @@ export class RoomsService {
 
   // ─── Create Room ─────────────────────────────────────────────────────────────
 
-  async createRoom() {
+  async createRoom(dto: CreateRoomDto) {
+    const { username } = dto;
     const roomCode = await this.codeGenerator.generateUniqueRoomCode();
     const hostId = `usr_${Math.random().toString(36).substring(2, 9)}`;
 
@@ -54,13 +56,12 @@ export class RoomsService {
       theme: 'Cartoon',
     });
 
-    // ✅ FIXED: Using pipeline.setex() to safely avoid argument limits or type mismatch variations
     pipeline.setex(
       reservationKey,
       RESERVATION_TTL_SECONDS,
       JSON.stringify({
         playerId: hostId,
-        username: 'Host',
+        username,
         reservedAt: Date.now(),
       }),
     );
@@ -73,7 +74,9 @@ export class RoomsService {
     return {
       success: true,
       roomCode,
+      playerId: hostId,
       hostId,
+      username,
       reconnectToken,
       message: 'Lobby successfully initialized.',
     };
@@ -90,6 +93,8 @@ export class RoomsService {
     if (!roomExists) {
       throw new NotFoundException(`Room ${roomCode} does not exist.`);
     }
+
+    const roomMeta = await this.redis.hgetall(metaKey);
 
     // ── 2. Confirm room is still in LOBBY status ─────────────────────────────
     const stateKey = REDIS_KEYS.ROOM_STATE(roomCode);
@@ -150,6 +155,8 @@ export class RoomsService {
       success: true,
       roomCode,
       playerId,
+      username,
+      hostId: roomMeta.hostId,
       reconnectToken,
       message: `Successfully reserved slot in room ${roomCode}. Connect via WebSocket to finalize.`,
     };

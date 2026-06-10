@@ -9,7 +9,7 @@ export class JoinRoomDto {
   roomCode!: string;
 
   @IsString()
-  @Length(3, 20, { message: 'username must be between 3 and 20 characters.' })
+  @Length(1, 15, { message: 'username must be between 1 and 15 characters.' })
   @Matches(/^[a-zA-Z0-9_]+$/, {
     message: 'username must contain only letters, numbers, or underscores.',
   })

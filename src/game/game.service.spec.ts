@@ -508,6 +508,7 @@ describe('GameService', () => {
 
     it('should compile full roster logs extracted out from multi-exec pipelines', async () => {
       mockSmembers.mockResolvedValue(['p1']);
+      mockHgetall.mockResolvedValue({ hostId: 'host-1' });
       mockExec.mockResolvedValue([
         [
           null,
@@ -522,6 +523,31 @@ describe('GameService', () => {
         username: 'A',
         isHost: false,
         connected: true,
+      });
+    });
+
+    it('should include hostId on roster entries for the active host', async () => {
+      mockSmembers.mockResolvedValue(['host-1']);
+      mockHgetall.mockResolvedValue({ hostId: 'host-1' });
+      mockExec.mockResolvedValue([
+        [
+          null,
+          {
+            playerId: 'host-1',
+            username: 'Host',
+            isHost: 'true',
+            connected: 'true',
+          },
+        ],
+      ]);
+
+      const res = await service.getRoomRoster(roomCode);
+      expect(res[0]).toEqual({
+        playerId: 'host-1',
+        username: 'Host',
+        isHost: true,
+        connected: true,
+        hostId: 'host-1',
       });
     });
 
