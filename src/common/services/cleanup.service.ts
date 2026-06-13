@@ -93,4 +93,71 @@ export class CleanupService extends Logger {
       }),
     );
   }
+
+  /**
+   * Global Reaper Hook: Automatically sweeps up ALL keys belonging to a room code.
+   * Leverages non-blocking stream iteration (`scanStream`) wrapped in a Promise structure.
+   * Safe-casts and maps all errors explicitly to native Error classes to satisfy ESLint.
+   */
+  async reapOrphanedKeys(roomCode: string): Promise<void> {
+    const redis = this.redisService.getClient();
+
+    const stream = redis.scanStream({
+      match: `sti:v1:room:${roomCode}:*`,
+      count: 100,
+    });
+
+    const keysToDelete: string[] = [];
+
+    stream.on('data', (keys: string[]) => {
+      keysToDelete.push(...keys);
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      stream.on('end', () => {
+        if (keysToDelete.length === 0) {
+          resolve();
+          return;
+        }
+
+        redis
+          .del(...keysToDelete)
+          .then(() => {
+            this.log(
+              JSON.stringify({
+                event: 'reaper_cleanup_executed',
+                roomCode,
+                keysCount: keysToDelete.length,
+                message:
+                  'All orphaned and dynamic keys successfully purged by the global reaper.',
+              }),
+            );
+            resolve();
+          })
+          .catch((err: unknown) => {
+            // Guarantee an instance of Error for rule compliance
+            const errorInstance =
+              err instanceof Error ? err : new Error(String(err));
+            reject(errorInstance);
+          });
+      });
+
+      stream.on('error', (err: unknown) => {
+        // Guarantee an instance of Error for rule compliance
+        const errorInstance =
+          err instanceof Error ? err : new Error(String(err));
+        reject(errorInstance);
+      });
+    }).catch((err: unknown) => {
+      const message =
+        err instanceof Error ? err.message : 'Unknown scanStream exception';
+      this.error(
+        JSON.stringify({
+          event: 'reaper_cleanup_failed',
+          roomCode,
+          message,
+        }),
+      );
+    });
+  }
 }
