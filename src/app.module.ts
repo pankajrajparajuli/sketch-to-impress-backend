@@ -11,6 +11,7 @@ import { StiThrottlerModule } from './common/throttler/throttler.module';
 import { HealthController } from './health/health.controller';
 import { RoomsModule } from './rooms/rooms.module';
 import { GameModule } from './game/game.module';
+import { AdminModule } from './admin/admin.module';
 
 @Module({
   imports: [
@@ -60,6 +61,7 @@ import { GameModule } from './game/game.module';
 
     RoomsModule, // <-- Registered RoomsModule here
     GameModule,
+    AdminModule,
   ],
   controllers: [HealthController],
   providers: [
