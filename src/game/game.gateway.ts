@@ -31,6 +31,7 @@ interface JwtPayload {
   playerId: string;
   roomCode: string;
   isHost: boolean;
+  username: string;
 }
 
 // ─── Custom Socket Data Type ──────────────────────────────────────────────────
@@ -886,7 +887,7 @@ export class GameGateway
         return;
       }
 
-      const { playerId, roomCode, isHost } = payload;
+      const { playerId, roomCode, isHost, username } = payload;
 
       const metaKey = REDIS_KEYS.ROOM_META(roomCode);
       const roomExists = await this.redis.exists(metaKey);
@@ -902,6 +903,7 @@ export class GameGateway
       client.data.playerId = playerId;
       client.data.roomCode = roomCode;
       client.data.isHost = isHost;
+      client.data.username = username;
 
       const canReconnect = await this.gameService.canReconnect(playerId);
 
