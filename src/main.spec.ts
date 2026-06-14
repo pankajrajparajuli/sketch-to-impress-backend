@@ -14,6 +14,7 @@ describe('bootstrap', () => {
     mockApp = {
       useGlobalPipes: jest.fn(),
       useGlobalFilters: jest.fn(),
+      enableCors: jest.fn(),
       listen: listenMock,
     } as any;
     // Spy on NestFactory.create to return mockApp

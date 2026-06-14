@@ -428,6 +428,9 @@ describe('GameService', () => {
       const cleanupCallback = cleanupCall?.[0] as () => void;
       cleanupCallback();
 
+      // Flush microtasks since getRoomStatus and cleanupMatch are asynchronous
+      await new Promise((resolve) => setImmediate(resolve));
+
       expect(mockCleanupMatch).toHaveBeenCalledWith(roomCode, 3, ['p1']);
       setTimeoutSpy.mockRestore();
     });

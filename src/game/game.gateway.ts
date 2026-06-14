@@ -826,6 +826,11 @@ export class GameGateway
         status: RoomStatus.LOBBY, // This forces client stores to update status = "LOBBY"
       });
 
+      this.server.to(roomCode).emit('v1:game:lobby_reset', {
+        roomCode,
+        status: RoomStatus.LOBBY,
+      });
+
       this.logger.log(
         JSON.stringify({
           event: 'match_lobby_reset_success',

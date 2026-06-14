@@ -1,10 +1,23 @@
-import { describe, it, expect, jest } from '@jest/globals';
+import { describe, it, expect, jest, beforeEach } from '@jest/globals';
 import { ExecutionContext } from '@nestjs/common';
 import { WsException } from '@nestjs/websockets';
 import { GatewayGuard } from './gateway.guard';
+import { RedisService } from '../../redis/redis.service';
 
 describe('GatewayGuard', () => {
-  const guard = new GatewayGuard();
+  let guard: GatewayGuard;
+  let mockRedisClient: any;
+  let mockRedisService: any;
+
+  beforeEach(() => {
+    mockRedisClient = {
+      hgetall: jest.fn<() => Promise<Record<string, string>>>(),
+    };
+    mockRedisService = {
+      getClient: () => mockRedisClient,
+    };
+    guard = new GatewayGuard(mockRedisService as RedisService);
+  });
 
   const createMockContext = (clientData: any): ExecutionContext => {
     const mockSocket = {
@@ -17,29 +30,32 @@ describe('GatewayGuard', () => {
     } as unknown as ExecutionContext;
   };
 
-  it('should return true if client isHost is true', () => {
+  it('should return true if client playerId matches room hostId', async () => {
     const context = createMockContext({
-      isHost: true,
       roomCode: 'ABCDEF',
       playerId: 'usr_123',
     });
-    expect(guard.canActivate(context)).toBe(true);
+    mockRedisClient.hgetall.mockResolvedValue({ hostId: 'usr_123' });
+
+    const result = await guard.canActivate(context);
+    expect(result).toBe(true);
   });
 
-  it('should throw WsException if client isHost is false', () => {
+  it('should throw WsException if client playerId does not match room hostId', async () => {
     const context = createMockContext({
-      isHost: false,
       roomCode: 'ABCDEF',
-      playerId: 'usr_123',
+      playerId: 'usr_456',
     });
-    expect(() => guard.canActivate(context)).toThrow(WsException);
-    expect(() => guard.canActivate(context)).toThrow(
+    mockRedisClient.hgetall.mockResolvedValue({ hostId: 'usr_123' });
+
+    await expect(guard.canActivate(context)).rejects.toThrow(WsException);
+    await expect(guard.canActivate(context)).rejects.toThrow(
       'Only host can perform this action',
     );
   });
 
-  it('should throw WsException if client data is missing', () => {
+  it('should throw WsException if client data is missing', async () => {
     const context = createMockContext(undefined);
-    expect(() => guard.canActivate(context)).toThrow(WsException);
+    await expect(guard.canActivate(context)).rejects.toThrow(WsException);
   });
 });
