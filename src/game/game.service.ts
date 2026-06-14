@@ -345,12 +345,17 @@ export class GameService {
                 JSON.stringify({
                   event: 'cleanup_skipped_room_reset',
                   roomCode,
-                  message: 'Room already back in LOBBY — cleanup aborted to preserve Play Again state.',
+                  message:
+                    'Room already back in LOBBY — cleanup aborted to preserve Play Again state.',
                 }),
               );
               return;
             }
-            return this.cleanupService.cleanupMatch(roomCode, totalRounds, playerIds);
+            return this.cleanupService.cleanupMatch(
+              roomCode,
+              totalRounds,
+              playerIds,
+            );
           })
           .catch((err: unknown) => {
             const errorMessage =
@@ -507,7 +512,6 @@ export class GameService {
 
     return newHost;
   }
-
 
   async checkRoomOccupancy(roomCode: string): Promise<void> {
     const connectedPlayers = await this.getConnectedPlayers(roomCode);
@@ -701,7 +705,8 @@ export class GameService {
         JSON.stringify({
           event: 'cleanup_timer_cancelled',
           roomCode,
-          message: 'Post-game cleanup timer cancelled — Play Again fired before grace window expired.',
+          message:
+            'Post-game cleanup timer cancelled — Play Again fired before grace window expired.',
         }),
       );
     }
