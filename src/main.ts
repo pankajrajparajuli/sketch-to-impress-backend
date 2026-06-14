@@ -11,6 +11,16 @@ export async function bootstrap(): Promise<void> {
 
   const app = await NestFactory.create(AppModule);
 
+  // ── Enable CORS for frontend ──────────────────────────────────────────────
+  // This allows frontend to send requests to backend
+  app.enableCors({
+    origin: process.env.FRONTEND_URL
+      ? process.env.FRONTEND_URL.split(',')
+      : '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    credentials: true,
+  });
+
   // ── Global DTO validation ────────────────────────────────────────────────
   app.useGlobalPipes(
     new ValidationPipe({
