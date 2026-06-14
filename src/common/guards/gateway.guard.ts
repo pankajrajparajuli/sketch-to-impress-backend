@@ -1,6 +1,8 @@
 import { CanActivate, ExecutionContext, Injectable } from '@nestjs/common';
 import { WsException } from '@nestjs/websockets';
 import { Socket } from 'socket.io';
+import { RedisService } from '../../redis/redis.service';
+import { REDIS_KEYS } from '../../redis/redis.keys';
 
 interface AuthenticatedClientData {
   playerId: string;
@@ -10,16 +12,26 @@ interface AuthenticatedClientData {
 
 @Injectable()
 export class GatewayGuard implements CanActivate {
-  canActivate(context: ExecutionContext): boolean {
-    // Explicitly cast the untyped client to a socket instance matching your architecture
-    const client = context.switchToWs().getClient<Socket>();
+  constructor(private readonly redis: RedisService) {}
 
-    // Extrapolate and cast data to prevent implicit 'any' access errors
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const client = context.switchToWs().getClient<Socket>();
     const clientData = client.data as
       | Partial<AuthenticatedClientData>
       | undefined;
 
-    if (!clientData?.isHost) {
+    const playerId = clientData?.playerId;
+    const roomCode = clientData?.roomCode;
+
+    if (!playerId || !roomCode) {
+      throw new WsException('Only host can perform this action');
+    }
+
+    // Validate against Redis ROOM_META rather than the JWT-baked isHost flag.
+    // This correctly handles host migrations where the new host's JWT still
+    // carries isHost: false from their original join.
+    const meta = await this.redis.getClient().hgetall(REDIS_KEYS.ROOM_META(roomCode));
+    if (!meta || meta.hostId !== playerId) {
       throw new WsException('Only host can perform this action');
     }
 

@@ -3,10 +3,11 @@ import { GameGateway } from './game.gateway';
 import { GameService } from './game.service';
 import { RedisModule } from '../redis/redis.module';
 import { CleanupService } from '../common/services/cleanup.service';
+import { GatewayGuard } from '../common/guards/gateway.guard';
 
 @Module({
   imports: [RedisModule],
-  providers: [GameGateway, GameService, CleanupService],
+  providers: [GameGateway, GameService, CleanupService, GatewayGuard],
   exports: [GameService],
 })
 export class GameModule {}

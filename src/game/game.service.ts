@@ -31,6 +31,7 @@ function getReconnectGraceSeconds(): number {
 export class GameService {
   private readonly logger = new Logger(GameService.name);
   private readonly phaseTimers = new Map<string, NodeJS.Timeout>();
+  private readonly cleanupTimers = new Map<string, NodeJS.Timeout>();
 
   // Define the private callback property
   private phaseChangeCallback?: (roomCode: string, status: RoomStatus) => void;
@@ -325,11 +326,32 @@ export class GameService {
     this.phaseChangeCallback?.(roomCode, next);
 
     // 🛠️ Hook #2 — FINAL_RESULTS Delay
+    // Store the timer reference so resetMatch() can cancel it if Play Again fires
+    // before the grace window expires — preventing the cleanup from destroying
+    // a freshly-reset room.
     if (next === RoomStatus.FINAL_RESULTS) {
-      const gracePeriodSeconds = 30; // 30-second safe buffer for client UI rendering
-      setTimeout(() => {
-        this.cleanupService
-          .cleanupMatch(roomCode, totalRounds, playerIds)
+      const gracePeriodSeconds = 30;
+      const existingCleanup = this.cleanupTimers.get(roomCode);
+      if (existingCleanup) clearTimeout(existingCleanup);
+
+      const cleanupTimer = setTimeout(() => {
+        this.cleanupTimers.delete(roomCode);
+
+        // Safety guard: abort if host already clicked Play Again and room is LOBBY again
+        this.getRoomStatus(roomCode)
+          .then((currentStatus) => {
+            if (currentStatus === RoomStatus.LOBBY) {
+              this.logger.log(
+                JSON.stringify({
+                  event: 'cleanup_skipped_room_reset',
+                  roomCode,
+                  message: 'Room already back in LOBBY — cleanup aborted to preserve Play Again state.',
+                }),
+              );
+              return;
+            }
+            return this.cleanupService.cleanupMatch(roomCode, totalRounds, playerIds);
+          })
           .catch((err: unknown) => {
             const errorMessage =
               err instanceof Error ? err.message : 'Unknown cleanup error';
@@ -338,6 +360,8 @@ export class GameService {
             );
           });
       }, gracePeriodSeconds * 1000);
+
+      this.cleanupTimers.set(roomCode, cleanupTimer);
     }
 
     return {
@@ -474,11 +498,16 @@ export class GameService {
       return null;
     }
 
-    await redis.hset(REDIS_KEYS.PLAYER_HASH(newHost.playerId), {
-      isHost: 'true',
-    });
+    const pipeline = redis.pipeline();
+    pipeline.hset(REDIS_KEYS.PLAYER_HASH(newHost.playerId), { isHost: 'true' });
+    // Keep ROOM_META.hostId authoritative so GatewayGuard and validateHost
+    // recognise the new host immediately without requiring a JWT re-issue.
+    pipeline.hset(REDIS_KEYS.ROOM_META(roomCode), { hostId: newHost.playerId });
+    await pipeline.exec();
+
     return newHost;
   }
+
 
   async checkRoomOccupancy(roomCode: string): Promise<void> {
     const connectedPlayers = await this.getConnectedPlayers(roomCode);
@@ -661,6 +690,21 @@ export class GameService {
 
     // Cancel any pending phase transition set timeouts to avoid post-reset state contamination
     this.clearPhaseTimer(roomCode);
+
+    // Cancel the 30-second post-game cleanup timer — if it fires after reset it would
+    // delete ROOM_META, ROOM_STATE, and player hashes, destroying the new lobby.
+    const pendingCleanup = this.cleanupTimers.get(roomCode);
+    if (pendingCleanup) {
+      clearTimeout(pendingCleanup);
+      this.cleanupTimers.delete(roomCode);
+      this.logger.log(
+        JSON.stringify({
+          event: 'cleanup_timer_cancelled',
+          roomCode,
+          message: 'Post-game cleanup timer cancelled — Play Again fired before grace window expired.',
+        }),
+      );
+    }
 
     const redis = this.redisService.getClient();
     const state = await redis.hgetall(REDIS_KEYS.ROOM_STATE(roomCode));
