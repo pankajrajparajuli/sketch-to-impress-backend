@@ -710,27 +710,17 @@ export class GameGateway
     @ConnectedSocket() client: AppSocket,
     @MessageBody() dto: UpdateSettingsDto,
   ): Promise<void> {
-    const { roomCode, playerId, isHost } = client.data;
-
-    // 1. Authorization Guard: Only the host can adjust parameters
-    if (!isHost) {
-      client.emit('error:exception', {
-        success: false,
-        code: 'UNAUTHORIZED',
-        message: 'Only the host can modify room configurations.',
-      });
-      return;
-    }
+    const { roomCode, playerId } = client.data;
 
     try {
-      // 2. Save configurations to your room state inside Redis
+      // Save configurations to your room state inside Redis
       await this.gameService.updateRoomSettings(roomCode, {
         timerDuration: dto.timerDuration,
         totalRounds: dto.totalRounds,
         theme: dto.theme,
       });
 
-      // 3. Broadcast to ALL connected players so their UI automatically changes
+      // Broadcast to ALL connected players so their UI automatically changes
       this.server.to(roomCode).emit('v1:room:settings_updated', {
         roomCode,
         timerDuration: dto.timerDuration,
