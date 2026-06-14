@@ -11,12 +11,21 @@ export interface RedisConfig {
   port: number;
 }
 
+function getRequiredEnv(key: string): string {
+  const value = process.env[key];
+  if (value === undefined || value === null || value === '') {
+    throw new Error(`Environment variable ${key} is required but not set.`);
+  }
+  return value;
+}
+
 export default registerAs(
   'redis',
-  (): RedisConfig => ({
-    host: process.env.REDIS_HOST ?? 'localhost',
-    port: parseInt(process.env.REDIS_PORT ?? '6379', 10),
-  }),
+  (): RedisConfig => {
+    const host = getRequiredEnv('REDIS_HOST');
+    const port = parseInt(getRequiredEnv('REDIS_PORT'), 10);
+    return { host, port };
+  },
 );
 
 // ─── Redis Client Factory ──────────────────────────────────────────────────────
@@ -27,8 +36,8 @@ export default registerAs(
 // ──────────────────────────────────────────────────────────────────────────────
 
 export function buildRedisClient(): Redis {
-  const host = process.env.REDIS_HOST ?? 'localhost';
-  const port = parseInt(process.env.REDIS_PORT ?? '6379', 10);
+  const host = getRequiredEnv('REDIS_HOST');
+  const port = parseInt(getRequiredEnv('REDIS_PORT'), 10);
 
   const client = new Redis({
     host,
