@@ -703,19 +703,55 @@ export class GameGateway
     return { success: true };
   }
 
-  @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
   @UseGuards(GatewayGuard)
-  @SubscribeMessage('v1:host:update_settings')
-  async updateSettings(
+  @UsePipes(new ValidationPipe({ transform: true }))
+  @SubscribeMessage('v1:room:update_settings')
+  async handleUpdateSettings(
     @ConnectedSocket() client: AppSocket,
     @MessageBody() dto: UpdateSettingsDto,
   ): Promise<void> {
-    const { roomCode } = client.data;
+    const { roomCode, playerId, isHost } = client.data;
 
-    await this.gameService.updateRoomSettings(roomCode, dto);
+    // 1. Authorization Guard: Only the host can adjust parameters
+    if (!isHost) {
+      client.emit('error:exception', {
+        success: false,
+        code: 'UNAUTHORIZED',
+        message: 'Only the host can modify room configurations.',
+      });
+      return;
+    }
 
-    this.server.to(roomCode).emit('v1:room:settings_changed', dto);
-    this.server.to(roomCode).emit('v1:room:settings_updated', dto);
+    try {
+      // 2. Save configurations to your room state inside Redis
+      await this.gameService.updateRoomSettings(roomCode, {
+        timerDuration: dto.timerDuration,
+        totalRounds: dto.totalRounds,
+        theme: dto.theme,
+      });
+
+      // 3. Broadcast to ALL connected players so their UI automatically changes
+      this.server.to(roomCode).emit('v1:room:settings_updated', {
+        roomCode,
+        timerDuration: dto.timerDuration,
+        totalRounds: dto.totalRounds,
+        theme: dto.theme,
+      });
+
+      this.logger.log(
+        JSON.stringify({
+          event: 'gateway_room_settings_updated',
+          roomCode,
+          updatedBy: playerId,
+          settings: dto,
+        }),
+      );
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to update settings.';
+      this.logger.error(`[Settings update error]: ${message}`);
+      client.emit('error:exception', { success: false, message });
+    }
   }
 
   @UseGuards(GatewayGuard)
