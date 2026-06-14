@@ -816,13 +816,14 @@ export class GameGateway
     try {
       this.clearGalleryTimer(roomCode);
 
-      // 1. Run multi/exec transaction sequence inside the service layer
+      // 1. Clear volatile vectors, ratings, and boards via your transaction service layer
       await this.gameService.resetMatch(roomCode, playerId);
 
-      // 2. Transmit lobby downgrade event to return clients instantly to lobby layouts
-      this.server.to(roomCode).emit('v1:game:lobby_reset', {
+      // 2. ── 🔧 FIX EVENT COLLISION ─────────────────────────────────────────
+      // Transmit the standard phase change event to trigger the frontend layout transition
+      this.server.to(roomCode).emit('v1:game:phase_changed', {
         roomCode,
-        status: RoomStatus.LOBBY,
+        status: RoomStatus.LOBBY, // This forces client stores to update status = "LOBBY"
       });
 
       this.logger.log(

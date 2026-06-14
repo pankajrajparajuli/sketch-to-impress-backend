@@ -291,8 +291,13 @@ export class GameService {
         if (roundData < totalRounds) {
           currentRound = roundData + 1;
 
+          // 🛠️ FIX: Calculate fresh drawing round timestamps to prevent client-side auto-submit issues
+          const drawingTimeSeconds = Number(state.timerDuration ?? 90);
+          const freshRoundEndTimestamp = Date.now() + drawingTimeSeconds * 1000;
+
           await redis.hset(REDIS_KEYS.ROOM_STATE(roomCode), {
             currentRound: String(currentRound),
+            roundEndTimestamp: String(freshRoundEndTimestamp),
           });
 
           prompt = await this.getUniquePrompt(roomCode);
