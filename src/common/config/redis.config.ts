@@ -9,6 +9,7 @@ import Redis from 'ioredis';
 export interface RedisConfig {
   host: string;
   port: number;
+  password?: string; // Added password to typing schema
 }
 
 function getRequiredEnv(key: string): string {
@@ -24,7 +25,8 @@ export default registerAs(
   (): RedisConfig => {
     const host = getRequiredEnv('REDIS_HOST');
     const port = parseInt(getRequiredEnv('REDIS_PORT'), 10);
-    return { host, port };
+    const password = process.env.REDIS_PASSWORD; // Optional, won't throw if missing locally
+    return { host, port, password };
   },
 );
 
@@ -38,8 +40,10 @@ export default registerAs(
 export function buildRedisClient(): Redis {
   const host = getRequiredEnv('REDIS_HOST');
   const port = parseInt(getRequiredEnv('REDIS_PORT'), 10);
+  const password = process.env.REDIS_PASSWORD; // Optional variable
 
-  const client = new Redis({
+  // 1. Prepare base options structure
+  const redisOptions: any = {
     host,
     port,
 
@@ -62,7 +66,20 @@ export function buildRedisClient(): Redis {
     enableOfflineQueue: true,
     connectTimeout: 10_000,
     maxRetriesPerRequest: 3,
-  });
+  };
+
+  // 2. Inject the password dynamically if it's set in the environment
+  if (password) {
+    redisOptions.password = password;
+  }
+
+  // 3. CRUCIAL FOR UPSTASH: If running in production or talking to Upstash, 
+  // inject an empty object configuration for TLS to encrypt transmissions.
+  if (process.env.NODE_ENV === 'production' || host.includes('upstash.io')) {
+    redisOptions.tls = {};
+  }
+
+  const client = new Redis(redisOptions);
 
   // ── Connection lifecycle hooks ──────────────────────────────────────────────
   client.on('connect', () => {
